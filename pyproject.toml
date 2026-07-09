@@ -1,0 +1,9 @@
+[project]
+name = "ucf-rs"
+version = "0.2.0"
+description = "Overlay-first citation runtime for source-clean traceability"
+requires-python = ">=3.10"
+
+[tool.ucf-rs]
+runtime = "stdlib"
+authority = ".ucf-rs"

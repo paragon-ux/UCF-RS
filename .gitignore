@@ -1,0 +1,7 @@
+.ucf-rs/
+.tmp-test/
+__pycache__/
+*.pyc
+docs/ucf-trace-ledger.jsonl
+docs/ucf-trace-status.json
+docs/ucf-trace-report.md
