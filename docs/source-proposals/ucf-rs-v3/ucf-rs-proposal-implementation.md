@@ -431,6 +431,7 @@ Required transitions:
 ```text
 activate
 edit-transform
+edit-refresh
 accept
 deactivate
 reactivate
@@ -442,7 +443,9 @@ metadata
 
 Only `accept`, `activate`, and `reactivate` may change
 `accepted_content_hash`. `edit-transform` changes current range and current
-content hash but does not accept changed evidence.
+content hash but does not accept changed evidence. `edit-refresh` refreshes
+document revision authority for a partition whose range and content were not
+changed by the edit.
 
 ## 10. Operation Log Schema
 
@@ -474,6 +477,7 @@ Each line of `.ucf-rs/operation-log.jsonl` records an explicit operation:
     }
   ],
   "affected_partitions": ["AUTH-LOGIN/001"],
+  "refreshed_partitions": ["AUTH-AUDIT/001"],
   "created_at": "2026-07-09T18:00:00Z"
 }
 ```
@@ -556,10 +560,13 @@ document.apply_edit(session_id, document_before_hash, edits, document_after_hash
 Behavior:
 
 1. Verify session and base epoch.
-2. Transform all affected partition ranges.
-3. Recompute current content hash for affected partitions.
-4. Append operation log record.
-5. Append `edit-transform` index records for affected partitions.
+2. Transform all active partition ranges for the edited document.
+3. Recompute current content hash for transformed partitions and refresh
+   document revision authority for unaffected partitions.
+4. Append operation log record with `affected_partitions` for non-unaffected
+   transforms and `refreshed_partitions` for unaffected refreshes.
+5. Append `edit-transform` index records for affected partitions and
+   `edit-refresh` index records for refreshed partitions.
 6. Return updated overlays and statuses.
 
 ### 12.4 Accept Current Partition

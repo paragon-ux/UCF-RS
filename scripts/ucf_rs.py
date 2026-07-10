@@ -373,9 +373,54 @@ def read_operations(paths: StorePaths) -> tuple[list[dict[str, Any]], list[dict[
     return records, diagnostics
 
 
+def operation_partition_set(operation: dict[str, Any], field: str) -> set[str]:
+    value = operation.get(field)
+    if not isinstance(value, list):
+        return set()
+    return {item for item in value if isinstance(item, str)}
+
+
+def index_operation_coverage_diagnostic(
+    paths: StorePaths,
+    line_number: int,
+    index_record: dict[str, Any],
+    operation_record: dict[str, Any],
+) -> dict[str, Any] | None:
+    transition = index_record.get("transition")
+    if transition == "edit-transform":
+        operation_field = "affected_partitions"
+    elif transition == "edit-refresh":
+        operation_field = "refreshed_partitions"
+    else:
+        return None
+    partition_id = index_record.get("partition_id")
+    if operation_record.get("operation_type") != "edit" or not isinstance(partition_id, str):
+        return {
+            "code": "E_INDEX_OPERATION_COVERAGE",
+            "severity": "fatal",
+            "message": f"{transition} index record is not covered by an edit operation",
+            "path": relative_path(paths.root, paths.index),
+            "line": line_number,
+        }
+    if partition_id not in operation_partition_set(operation_record, operation_field):
+        return {
+            "code": "E_INDEX_OPERATION_COVERAGE",
+            "severity": "fatal",
+            "message": f"{transition} index record is not covered by operation {operation_field}",
+            "path": relative_path(paths.root, paths.index),
+            "line": line_number,
+        }
+    return None
+
+
 def read_index(paths: StorePaths, operations: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     records, diagnostics = read_hashed_jsonl(paths.index, "index_record_hash", index_record_hash)
-    operation_hashes = {record.get("operation_hash") for record in operations}
+    operations_by_hash = {
+        record.get("operation_hash"): record
+        for record in operations
+        if isinstance(record.get("operation_hash"), str)
+    }
+    operation_hashes = set(operations_by_hash)
     previous_index_hash: str | None = None
     current_epoch = 0
     current_epoch_hash = GENESIS_EPOCH_HASH
@@ -401,6 +446,12 @@ def read_index(paths: StorePaths, operations: Iterable[dict[str, Any]]) -> tuple
                     "line": line_number,
                 }
             )
+        else:
+            coverage_diagnostic = index_operation_coverage_diagnostic(
+                paths, line_number, record, operations_by_hash[record_operation_hash]
+            )
+            if coverage_diagnostic:
+                diagnostics.append(coverage_diagnostic)
         server_epoch = record.get("server_epoch")
         server_epoch_hash = record.get("server_epoch_hash")
         if server_epoch == current_epoch + 1 and isinstance(record_operation_hash, str):
@@ -613,6 +664,7 @@ def append_operation(
     document_after_hash: str,
     edits: list[dict[str, Any]],
     affected_partitions: list[str],
+    refreshed_partitions: list[str] | None = None,
 ) -> dict[str, Any]:
     record: dict[str, Any] = {
         "schema_version": OPERATION_SCHEMA,
@@ -630,6 +682,8 @@ def append_operation(
         "created_at": utc_now(),
         "tool": {"name": TOOL_NAME, "version": TOOL_VERSION},
     }
+    if refreshed_partitions:
+        record["refreshed_partitions"] = refreshed_partitions
     record["operation_hash"] = operation_hash(record)
     append_jsonl(paths.operations, record)
     operations.append(record)
@@ -957,13 +1011,14 @@ def append_edit_index_record(
     current_text = document_text[selected_range.start : selected_range.end]
     evidence = record.get("evidence", {})
     accepted_line_hashes = evidence.get("line_hashes") if isinstance(evidence, dict) else None
+    transition = "edit-refresh" if result.status == "unaffected" else "edit-transform"
     return append_index_record(
         paths,
         index_records,
         operation_record,
         server_epoch,
         server_epoch_value_hash,
-        "edit-transform",
+        transition,
         "active",
         relative_uri,
         str(record["partition_id"]),
@@ -1029,6 +1084,11 @@ def command_apply_edit(args: argparse.Namespace) -> int:
         for record, result in transformed
         if result.status != "unaffected"
     ]
+    refreshed = [
+        str(record["partition_id"])
+        for record, result in transformed
+        if result.status == "unaffected"
+    ]
     operation_record = append_operation(
         paths,
         operations,
@@ -1039,6 +1099,7 @@ def command_apply_edit(args: argparse.Namespace) -> int:
         after_hash,
         [edit_record(edit_start, edit_end, inserted_text)],
         affected,
+        refreshed,
     )
     server_epoch = current_epoch
     server_epoch_value_hash = current_epoch_hash
@@ -1065,6 +1126,7 @@ def command_apply_edit(args: argparse.Namespace) -> int:
     output = {
         "operation_hash": operation_record["operation_hash"],
         "affected_partitions": affected,
+        "refreshed_partitions": refreshed,
         "server_epoch_hash": server_epoch_value_hash,
         "overlays": [
             {
@@ -1221,6 +1283,34 @@ def replay_offline_record(
     if after_hash != record.get("document_after_hash"):
         raise DemoError("offline operation document text does not match its recorded after hash")
     source_path = project_path(paths.root, relative_uri)
+    active_records = document_active_records(paths.root, index_records, relative_uri)
+    transformed: list[tuple[dict[str, Any], TransformResult]] = []
+    edit_start = int(edit["start"])
+    edit_end = int(edit["end"])
+    normalized_inserted_text = normalize_text(inserted_text)
+    for active in active_records:
+        record_range = active.get("range", {})
+        if not isinstance(record_range, dict):
+            continue
+        result = transform_range(
+            int(record_range["start"]),
+            int(record_range["end"]),
+            edit_start,
+            edit_end,
+            len(normalized_inserted_text),
+            "outside",
+        )
+        transformed.append((active, result))
+    affected = [
+        str(active["partition_id"])
+        for active, result in transformed
+        if result.status != "unaffected"
+    ]
+    refreshed = [
+        str(active["partition_id"])
+        for active, result in transformed
+        if result.status == "unaffected"
+    ]
     write_text_document(source_path, document_after_text)
     current_epoch, current_epoch_hash = last_epoch(index_records)
     operation_record = append_operation(
@@ -1231,26 +1321,12 @@ def replay_offline_record(
         current_epoch_hash,
         str(record["document_before_hash"]),
         str(record["document_after_hash"]),
-        [edit_record(int(edit["start"]), int(edit["end"]), inserted_text)],
-        [str(item) for item in record.get("affected_partitions", [])],
+        [edit_record(edit_start, edit_end, inserted_text)],
+        affected,
+        refreshed,
     )
     server_epoch = current_epoch
     server_epoch_value_hash = current_epoch_hash
-    active_records = document_active_records(paths.root, index_records, relative_uri)
-    transformed: list[tuple[dict[str, Any], TransformResult]] = []
-    for active in active_records:
-        record_range = active.get("range", {})
-        if not isinstance(record_range, dict):
-            continue
-        result = transform_range(
-            int(record_range["start"]),
-            int(record_range["end"]),
-            int(edit["start"]),
-            int(edit["end"]),
-            len(normalize_text(inserted_text)),
-            "outside",
-        )
-        transformed.append((active, result))
     if transformed:
         server_epoch += 1
         server_epoch_value_hash = epoch_hash(current_epoch_hash, operation_record["operation_hash"])
