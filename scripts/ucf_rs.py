@@ -941,6 +941,45 @@ def document_active_records(
     ]
 
 
+def append_edit_index_record(
+    paths: StorePaths,
+    index_records: list[dict[str, Any]],
+    operation_record: dict[str, Any],
+    server_epoch: int,
+    server_epoch_value_hash: str,
+    relative_uri: str,
+    document_revision_hash: str,
+    document_text: str,
+    record: dict[str, Any],
+    result: TransformResult,
+) -> dict[str, Any]:
+    selected_range = range_from_offsets(document_text, result.start, result.end)
+    current_text = document_text[selected_range.start : selected_range.end]
+    evidence = record.get("evidence", {})
+    accepted_line_hashes = evidence.get("line_hashes") if isinstance(evidence, dict) else None
+    return append_index_record(
+        paths,
+        index_records,
+        operation_record,
+        server_epoch,
+        server_epoch_value_hash,
+        "edit-transform",
+        "active",
+        relative_uri,
+        str(record["partition_id"]),
+        str(record["upstream_handle"]),
+        str(record["accepted_content_hash"]),
+        content_hash_text(current_text),
+        document_revision_hash,
+        selected_range,
+        current_text,
+        result.status,
+        accepted_line_hashes if isinstance(accepted_line_hashes, list) else None,
+        evidence.get("line_count") if isinstance(evidence, dict) else None,
+        evidence.get("byte_count") if isinstance(evidence, dict) else None,
+    )
+
+
 def command_apply_edit(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     paths = store_paths(root, args.store)
@@ -982,11 +1021,14 @@ def command_apply_edit(args: argparse.Namespace) -> int:
             len(inserted_text),
             args.boundary_policy,
         )
-        if result.status != "unaffected":
-            transformed.append((record, result))
+        transformed.append((record, result))
     write_text_document(source_path, new_text)
     current_epoch, current_epoch_hash = last_epoch(index_records)
-    affected = [str(record["partition_id"]) for record, _ in transformed]
+    affected = [
+        str(record["partition_id"])
+        for record, result in transformed
+        if result.status != "unaffected"
+    ]
     operation_record = append_operation(
         paths,
         operations,
@@ -1005,32 +1047,18 @@ def command_apply_edit(args: argparse.Namespace) -> int:
         server_epoch_value_hash = epoch_hash(current_epoch_hash, operation_record["operation_hash"])
     emitted: list[dict[str, Any]] = []
     for record, result in transformed:
-        selected_range = range_from_offsets(new_text, result.start, result.end)
-        current_text = new_text[selected_range.start : selected_range.end]
-        current_hash = content_hash_text(current_text)
-        evidence = record.get("evidence", {})
-        accepted_line_hashes = evidence.get("line_hashes") if isinstance(evidence, dict) else None
         emitted.append(
-            append_index_record(
+            append_edit_index_record(
                 paths,
                 index_records,
                 operation_record,
                 server_epoch,
                 server_epoch_value_hash,
-                "edit-transform",
-                "active",
                 relative_uri,
-                str(record["partition_id"]),
-                str(record["upstream_handle"]),
-                str(record["accepted_content_hash"]),
-                current_hash,
                 after_hash,
-                selected_range,
-                current_text,
-                result.status,
-                accepted_line_hashes if isinstance(accepted_line_hashes, list) else None,
-                evidence.get("line_count") if isinstance(evidence, dict) else None,
-                evidence.get("byte_count") if isinstance(evidence, dict) else None,
+                new_text,
+                record,
+                result,
             )
         )
     append_document_record(paths, relative_uri, document_record_id, after_hash, server_epoch_value_hash)
@@ -1222,39 +1250,26 @@ def replay_offline_record(
             len(normalize_text(inserted_text)),
             "outside",
         )
-        if result.status != "unaffected":
-            transformed.append((active, result))
+        transformed.append((active, result))
     if transformed:
         server_epoch += 1
         server_epoch_value_hash = epoch_hash(current_epoch_hash, operation_record["operation_hash"])
     emitted: list[str] = []
     for active, result in transformed:
-        selected_range = range_from_offsets(document_after_text, result.start, result.end)
-        current_text = document_after_text[selected_range.start : selected_range.end]
-        evidence = active.get("evidence", {})
-        accepted_line_hashes = evidence.get("line_hashes") if isinstance(evidence, dict) else None
-        appended = append_index_record(
+        appended = append_edit_index_record(
             paths,
             index_records,
             operation_record,
             server_epoch,
             server_epoch_value_hash,
-            "edit-transform",
-            "active",
             relative_uri,
-            str(active["partition_id"]),
-            str(active["upstream_handle"]),
-            str(active["accepted_content_hash"]),
-            content_hash_text(current_text),
             str(record["document_after_hash"]),
-            selected_range,
-            current_text,
-            result.status,
-            accepted_line_hashes if isinstance(accepted_line_hashes, list) else None,
-            evidence.get("line_count") if isinstance(evidence, dict) else None,
-            evidence.get("byte_count") if isinstance(evidence, dict) else None,
+            document_after_text,
+            active,
+            result,
         )
-        emitted.append(str(appended["partition_id"]))
+        if result.status != "unaffected":
+            emitted.append(str(appended["partition_id"]))
     append_document_record(
         paths,
         relative_uri,
@@ -1768,6 +1783,12 @@ def command_accept(args: argparse.Namespace) -> int:
     doc_hash = document_hash_text(text)
     if doc_hash != record.get("document_revision_hash"):
         raise DemoError("document has unmanaged changes; reconcile or redeclare before accepting")
+    current_status = partition_status(root, paths, record)
+    if current_status.get("action") not in {"accept_current", "confirm_boundary"}:
+        raise DemoError(
+            f"partition status {current_status.get('status')} cannot be accepted; "
+            f"required action is {current_status.get('action')}"
+        )
     record_range = record.get("range", {})
     selected_range = range_from_offsets(text, int(record_range["start"]), int(record_range["end"]))
     current_hash = content_hash_text(text[selected_range.start : selected_range.end])
@@ -1897,11 +1918,12 @@ def command_export_ledger(args: argparse.Namespace) -> int:
     content = export_content_from_partitions(report["partitions"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(content)
+    refreshed_report = status_report(root, paths)
     output = {
         "path": relative_path(root, output_path),
         "record_count": len(records),
         "export_ledger_hash": export_ledger_hash(content),
-        "status_valid": not report["diagnostics"],
+        "status_valid": not refreshed_report["diagnostics"],
     }
     if args.format == "json":
         print(json.dumps(output, indent=2, sort_keys=True))
@@ -2073,6 +2095,54 @@ def command_json_result(command: Any, args: argparse.Namespace) -> dict[str, Any
     return result
 
 
+def require_server_string(params: dict[str, Any], method: str, name: str) -> str:
+    value = params.get(name)
+    if not isinstance(value, str):
+        raise DemoError(f"{method} requires string params.{name}")
+    return value
+
+
+def optional_server_string(
+    params: dict[str, Any], method: str, name: str, default: str | None = None
+) -> str | None:
+    value = params.get(name, default)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise DemoError(f"{method} requires string params.{name}")
+    return value
+
+
+def require_server_path(params: dict[str, Any], method: str) -> str:
+    value = params.get("path")
+    if value is None:
+        value = params.get("document")
+    if not isinstance(value, str):
+        raise DemoError(f"{method} requires string params.path")
+    return value
+
+
+def require_server_int(params: dict[str, Any], method: str, name: str) -> int:
+    value = params.get(name)
+    if type(value) is not int:
+        raise DemoError(f"{method} requires integer params.{name}")
+    return value
+
+
+def optional_server_bool(params: dict[str, Any], method: str, name: str, default: bool = False) -> bool:
+    value = params.get(name, default)
+    if not isinstance(value, bool):
+        raise DemoError(f"{method} requires boolean params.{name}")
+    return value
+
+
+def optional_boundary_policy(params: dict[str, Any], method: str) -> str:
+    value = params.get("boundary_policy", "outside")
+    if value not in {"outside", "inside"}:
+        raise DemoError(f"{method} requires params.boundary_policy to be outside or inside")
+    return str(value)
+
+
 def serve_dispatch(root: Path, store: str, request: dict[str, Any]) -> dict[str, Any]:
     method = request.get("method")
     params = request.get("params", {})
@@ -2116,11 +2186,11 @@ def serve_dispatch(root: Path, store: str, request: dict[str, Any]) -> dict[str,
             argparse.Namespace(
                 root=str(root),
                 store=store,
-                handle=params.get("handle"),
-                path=params.get("path") or params.get("document"),
-                lines=params.get("lines"),
-                expected_content_hash=params.get("expected_content_hash"),
-                task_context=bool(params.get("task_context", False)),
+                handle=require_server_string(params, method, "handle"),
+                path=require_server_path(params, method),
+                lines=require_server_string(params, method, "lines"),
+                expected_content_hash=optional_server_string(params, method, "expected_content_hash"),
+                task_context=optional_server_bool(params, method, "task_context"),
             ),
         )
     if method == "partition.activate":
@@ -2129,11 +2199,11 @@ def serve_dispatch(root: Path, store: str, request: dict[str, Any]) -> dict[str,
             argparse.Namespace(
                 root=str(root),
                 store=store,
-                handle=params.get("handle"),
-                path=params.get("path") or params.get("document"),
-                lines=params.get("lines"),
-                expected_content_hash=params.get("expected_content_hash"),
-                task_context=bool(params.get("task_context", False)),
+                handle=require_server_string(params, method, "handle"),
+                path=require_server_path(params, method),
+                lines=require_server_string(params, method, "lines"),
+                expected_content_hash=optional_server_string(params, method, "expected_content_hash"),
+                task_context=optional_server_bool(params, method, "task_context"),
                 format="json",
             ),
         )
@@ -2143,11 +2213,11 @@ def serve_dispatch(root: Path, store: str, request: dict[str, Any]) -> dict[str,
             argparse.Namespace(
                 root=str(root),
                 store=store,
-                path=params.get("path") or params.get("document"),
-                start=params.get("start"),
-                end=params.get("end"),
-                insert=params.get("insert", ""),
-                boundary_policy=params.get("boundary_policy", "outside"),
+                path=require_server_path(params, method),
+                start=require_server_int(params, method, "start"),
+                end=require_server_int(params, method, "end"),
+                insert=optional_server_string(params, method, "insert", "") or "",
+                boundary_policy=optional_boundary_policy(params, method),
                 format="json",
             ),
         )
@@ -2157,11 +2227,11 @@ def serve_dispatch(root: Path, store: str, request: dict[str, Any]) -> dict[str,
             argparse.Namespace(
                 root=str(root),
                 store=store,
-                path=params.get("path") or params.get("document"),
-                start=params.get("start"),
-                end=params.get("end"),
-                insert=params.get("insert", ""),
-                boundary_policy=params.get("boundary_policy", "outside"),
+                path=require_server_path(params, method),
+                start=require_server_int(params, method, "start"),
+                end=require_server_int(params, method, "end"),
+                insert=optional_server_string(params, method, "insert", "") or "",
+                boundary_policy=optional_boundary_policy(params, method),
                 format="json",
             ),
         )
@@ -2176,8 +2246,10 @@ def serve_dispatch(root: Path, store: str, request: dict[str, Any]) -> dict[str,
             argparse.Namespace(
                 root=str(root),
                 store=store,
-                partition_id=params.get("partition_id"),
-                previous_index_record_hash=params.get("previous_index_record_hash"),
+                partition_id=require_server_string(params, method, "partition_id"),
+                previous_index_record_hash=optional_server_string(
+                    params, method, "previous_index_record_hash"
+                ),
                 format="json",
             ),
         )
@@ -2187,7 +2259,8 @@ def serve_dispatch(root: Path, store: str, request: dict[str, Any]) -> dict[str,
             argparse.Namespace(
                 root=str(root),
                 store=store,
-                output=params.get("output", EXPORT_LEDGER_DEFAULT),
+                output=optional_server_string(params, method, "output", EXPORT_LEDGER_DEFAULT)
+                or EXPORT_LEDGER_DEFAULT,
                 format="json",
             ),
         )

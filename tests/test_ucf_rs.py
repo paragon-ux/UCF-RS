@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 import threading
+import urllib.error
 import urllib.request
 import unittest
 from pathlib import Path
@@ -527,8 +528,31 @@ class UcfRsDemoTests(unittest.TestCase):
             status = self.status(root)
             self.assertEqual(status["summary"], {"valid": 1})
             self.assertEqual(status["partitions"][0]["action"], "none")
-            self.assertEqual(len(self.jsonl(root / ".ucf-rs" / "citation-index.jsonl")), 1)
+            self.assertEqual(len(self.jsonl(root / ".ucf-rs" / "citation-index.jsonl")), 2)
             self.assertEqual(len(self.jsonl(root / ".ucf-rs" / "operation-log.jsonl")), 2)
+
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "apply-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        "0",
+                        "--end",
+                        "0",
+                        "--insert",
+                        "head\n",
+                    ]
+                ),
+                0,
+            )
+            refreshed = self.status(root)
+            self.assertEqual(refreshed["summary"], {"valid": 1})
+            self.assertEqual(len(self.jsonl(root / ".ucf-rs" / "citation-index.jsonl")), 3)
+            self.assertEqual(len(self.jsonl(root / ".ucf-rs" / "operation-log.jsonl")), 3)
 
     def test_boundary_insert_policies_distinguish_outside_from_inside(self) -> None:
         with self.make_root() as directory:
@@ -617,6 +641,11 @@ class UcfRsDemoTests(unittest.TestCase):
             status = self.status(root)
             self.assertEqual(status["summary"], {"missing": 1})
             self.assertEqual(status["partitions"][0]["action"], "redeclare_partition")
+            self.assertEqual(
+                ucf.main(["--root", str(root), "accept", "--partition-id", "AUTH-ROTATE/001"]),
+                2,
+            )
+            self.assertEqual(self.status(root)["summary"], {"missing": 1})
 
     def test_duplicate_exact_unmanaged_recovery_is_ambiguous(self) -> None:
         with self.make_root() as directory:
@@ -741,6 +770,57 @@ class UcfRsDemoTests(unittest.TestCase):
             self.assertEqual(ucf.main(["--root", str(root), "replay-offline"]), 2)
             self.assertEqual(len(self.jsonl(root / ".ucf-rs" / "offline-queue.jsonl")), 1)
 
+    def test_offline_replay_refreshes_unaffected_partition_revision(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            original = "alpha\nbeta\n"
+            self.write(source, original)
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "queue-offline-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        str(len(original)),
+                        "--end",
+                        str(len(original)),
+                        "--insert",
+                        "tail\n",
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(self.status(root)["summary"], {"valid": 1})
+            self.assertEqual(ucf.main(["--root", str(root), "replay-offline"]), 0)
+            self.assertEqual(self.status(root)["summary"], {"valid": 1})
+            self.assertEqual(len(self.jsonl(root / ".ucf-rs" / "citation-index.jsonl")), 2)
+
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "apply-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        "0",
+                        "--end",
+                        "0",
+                        "--insert",
+                        "head\n",
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(self.status(root)["summary"], {"valid": 1})
+
     def test_stale_export_is_a_strict_status_failure_until_regenerated(self) -> None:
         with self.make_root() as directory:
             root = Path(directory)
@@ -773,7 +853,8 @@ class UcfRsDemoTests(unittest.TestCase):
             self.assertIn("E_EXPORT_STALE", report["summary"])
             self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 1)
 
-            self.assertEqual(ucf.main(["--root", str(root), "export", "ledger"]), 0)
+            exported = self.run_json(["--root", str(root), "export", "ledger"])
+            self.assertEqual(exported["status_valid"], True)
             fresh = self.status(root)
             self.assertNotIn("E_EXPORT_STALE", fresh["summary"])
 
@@ -966,6 +1047,36 @@ class UcfRsDemoTests(unittest.TestCase):
             self.assertEqual(payload["jsonrpc"], "2.0")
             self.assertEqual(payload["id"], "resolve-1")
             self.assertEqual(payload["result"]["overlays"][0]["partition_id"], "AUTH-ROTATE/001")
+
+    def test_http_transport_reports_malformed_mutating_params_as_json_error(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            self.write(source, "alpha\nbeta\n")
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+
+            server = ucf.make_http_server(root, ucf.STORE_DEFAULT, "127.0.0.1", 0)
+            thread = threading.Thread(target=server.handle_request)
+            thread.start()
+            try:
+                body = json.dumps(
+                    {"method": "document.apply_edit", "params": {"path": "src/auth.py"}}
+                ).encode("utf-8")
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_address[1]}",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=5)
+                payload = json.loads(raised.exception.read().decode("utf-8"))
+            finally:
+                thread.join(timeout=5)
+                server.server_close()
+
+            self.assertFalse(payload["ok"])
+            self.assertIn("document.apply_edit requires integer params.start", payload["error"])
 
 
 if __name__ == "__main__":
