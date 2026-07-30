@@ -67,6 +67,57 @@ class UcfRsDemoTests(unittest.TestCase):
             ]
         )
 
+    def test_authority_write_lock_serializes_threads(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            paths = ucf.store_paths(root, ucf.STORE_DEFAULT)
+            first_entered = threading.Event()
+            release_first = threading.Event()
+            second_entered = threading.Event()
+            errors: list[BaseException] = []
+
+            def first_writer() -> None:
+                try:
+                    with ucf.authority_write_lock(paths):
+                        first_entered.set()
+                        release_first.wait(timeout=2)
+                except BaseException as error:
+                    errors.append(error)
+
+            def second_writer() -> None:
+                try:
+                    first_entered.wait(timeout=2)
+                    with ucf.authority_write_lock(paths):
+                        second_entered.set()
+                except BaseException as error:
+                    errors.append(error)
+
+            first = threading.Thread(target=first_writer)
+            second = threading.Thread(target=second_writer)
+            first.start()
+            self.assertTrue(first_entered.wait(timeout=2))
+            second.start()
+            self.assertFalse(second_entered.wait(timeout=0.1))
+            release_first.set()
+            self.assertTrue(second_entered.wait(timeout=2))
+            first.join(timeout=2)
+            second.join(timeout=2)
+            self.assertEqual(errors, [])
+
+            for command in (
+                ucf.command_init,
+                ucf.command_activate,
+                ucf.command_apply_edit,
+                ucf.command_queue_offline_edit,
+                ucf.command_replay_offline,
+                ucf.command_accept,
+                ucf.command_reconcile,
+                ucf.command_deactivate,
+                ucf.command_reactivate,
+                ucf.command_import_registry,
+            ):
+                self.assertTrue(getattr(command, "_ucf_authority_mutation", False))
+
     def test_activation_keeps_source_clean_and_resolves_overlay(self) -> None:
         with self.make_root() as directory:
             root = Path(directory)
@@ -710,7 +761,7 @@ class UcfRsDemoTests(unittest.TestCase):
             )
             self.assertEqual(self.status(root)["summary"], {"valid": 1})
 
-    def test_offline_replay_detects_server_epoch_conflict(self) -> None:
+    def test_offline_replay_allows_unrelated_descendant_epoch(self) -> None:
         with self.make_root() as directory:
             root = Path(directory)
             source = root / "src" / "auth.py"
@@ -738,8 +789,157 @@ class UcfRsDemoTests(unittest.TestCase):
                 0,
             )
             self.assertEqual(self.activate(root, "src/other.py", "1:1"), 0)
+            self.assertEqual(ucf.main(["--root", str(root), "replay-offline"]), 0)
+            self.assertEqual((root / ".ucf-rs" / "offline-queue.jsonl").read_text(encoding="utf-8"), "")
+            statuses = {
+                partition["adapter"]["uri"]: partition["status"]
+                for partition in self.status(root)["partitions"]
+            }
+            self.assertEqual(statuses["src/auth.py"], "valid")
+            self.assertEqual(statuses["src/other.py"], "valid")
+
+    def test_offline_replay_rejects_same_document_descendant_epoch(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            self.write(source, "alpha\nbeta\n")
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "queue-offline-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        "0",
+                        "--end",
+                        "0",
+                        "--insert",
+                        "offline\n",
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(self.activate(root, "src/auth.py", "1:1"), 0)
             self.assertEqual(ucf.main(["--root", str(root), "replay-offline"]), 2)
             self.assertEqual(len(self.jsonl(root / ".ucf-rs" / "offline-queue.jsonl")), 1)
+
+    def test_offline_replay_preserves_boundary_policy(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            self.write(source, "alpha\nbeta\n")
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "queue-offline-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        "0",
+                        "--end",
+                        "0",
+                        "--insert",
+                        "inside\n",
+                        "--boundary-policy",
+                        "inside",
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(ucf.main(["--root", str(root), "replay-offline"]), 0)
+            self.assertEqual(self.status(root)["summary"], {"changed_unaccepted": 1})
+            operations = self.jsonl(root / ".ucf-rs" / "operation-log.jsonl")
+            self.assertEqual(operations[-1]["edits"][0]["boundary_policy"], "inside")
+
+    def test_offline_replay_rejects_same_document_operation_without_epoch_advance(
+        self,
+    ) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            paths = ucf.store_paths(root, ucf.STORE_DEFAULT)
+            source = root / "src" / "auth.py"
+
+            original = "alpha\nbeta\n"
+            server_after = "alpha\nbeta\nserver\n"
+
+            self.write(source, original)
+            self.assertEqual(
+                self.activate(root, "src/auth.py", "1:1"),
+                0,
+            )
+
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "queue-offline-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        "0",
+                        "--end",
+                        "0",
+                        "--insert",
+                        "offline\n",
+                    ]
+                ),
+                0,
+            )
+
+            operations, index_records = ucf.read_store_for_mutation(paths)
+            _, current_epoch_hash = ucf.last_epoch(index_records)
+
+            self.write(source, server_after)
+
+            ucf.append_operation(
+                paths,
+                operations,
+                "edit",
+                ucf.document_id(root, "src/auth.py"),
+                current_epoch_hash,
+                ucf.document_hash_text(original),
+                ucf.document_hash_text(server_after),
+                [
+                    ucf.edit_record(
+                        len(original),
+                        len(original),
+                        "server\n",
+                        "outside",
+                    )
+                ],
+                [],
+            )
+
+            operation_count = len(operations)
+            index_count = len(index_records)
+
+            self.assertEqual(
+                ucf.main(["--root", str(root), "replay-offline"]),
+                2,
+            )
+
+            final_operations, final_index = (
+                ucf.read_store_for_mutation(paths)
+            )
+            self.assertEqual(len(final_operations), operation_count)
+            self.assertEqual(len(final_index), index_count)
+            self.assertEqual(
+                source.read_text(encoding="utf-8"),
+                server_after,
+            )
+            self.assertEqual(
+                len(self.jsonl(paths.offline_queue)),
+                1,
+            )
 
     def test_stale_export_is_a_strict_status_failure_until_regenerated(self) -> None:
         with self.make_root() as directory:

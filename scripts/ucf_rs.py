@@ -15,12 +15,18 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 TOOL_NAME = "ucf-rs"
 TOOL_VERSION = "0.2.0"
@@ -198,6 +204,45 @@ def store_paths(root: Path, configured_store: str) -> StorePaths:
         handles=store / "handle-cache.jsonl",
         snapshots=store / "snapshots",
     )
+
+
+@contextlib.contextmanager
+def authority_write_lock(paths: StorePaths) -> Iterable[None]:
+    """Serialize authoritative mutations across threads and processes."""
+    paths.store.mkdir(parents=True, exist_ok=True)
+    lock_path = paths.store / "authority.lock"
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def authority_mutation(command: Any) -> Any:
+    """Wrap a CLI/server command in the project authority write lock."""
+    def wrapped(args: argparse.Namespace) -> int:
+        root = Path(args.root).resolve()
+        paths = store_paths(root, args.store)
+        with authority_write_lock(paths):
+            return command(args)
+
+    wrapped.__name__ = command.__name__
+    wrapped.__doc__ = command.__doc__
+    wrapped._ucf_authority_mutation = True
+    return wrapped
 
 
 def read_text_document(path: Path) -> str:
@@ -753,6 +798,7 @@ def append_index_record(
     return record
 
 
+@authority_mutation
 def command_init(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     paths = store_paths(root, args.store)
@@ -826,6 +872,7 @@ def command_preflight(args: argparse.Namespace) -> int:
     return 0
 
 
+@authority_mutation
 def command_activate(args: argparse.Namespace) -> int:
     plan = preflight_activation(args)
     root = Path(args.root).resolve()
@@ -919,15 +966,25 @@ def transform_range(
     return TransformResult(min(start, edit_start), max(min(start, edit_start), end + delta), "boundary_touched")
 
 
-def edit_record(start: int, end: int, inserted_text: str) -> dict[str, Any]:
+def edit_record(
+    start: int,
+    end: int,
+    inserted_text: str,
+    boundary_policy: str | None = None,
+) -> dict[str, Any]:
     normalized_insert = normalize_text(inserted_text)
-    return {
+    record: dict[str, Any] = {
         "range_encoding": "unicode-scalar",
         "start": start,
         "end": end,
         "inserted_text_hash": framed_hash("ucf.inserted_text.v1", normalized_insert.encode("utf-8")),
         "inserted_text_length": len(normalized_insert),
     }
+    if boundary_policy is not None:
+        if boundary_policy not in {"inside", "outside"}:
+            raise DemoError(f"unsupported boundary policy: {boundary_policy}")
+        record["boundary_policy"] = boundary_policy
+    return record
 
 
 def document_active_records(
@@ -941,6 +998,7 @@ def document_active_records(
     ]
 
 
+@authority_mutation
 def command_apply_edit(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     paths = store_paths(root, args.store)
@@ -995,7 +1053,7 @@ def command_apply_edit(args: argparse.Namespace) -> int:
         current_epoch_hash,
         before_hash,
         after_hash,
-        [edit_record(edit_start, edit_end, inserted_text)],
+        [edit_record(edit_start, edit_end, inserted_text, args.boundary_policy)],
         affected,
     )
     server_epoch = current_epoch
@@ -1061,6 +1119,7 @@ def append_offline_operation(
     relative_uri: str,
     document_record_id: str,
     base_server_epoch_hash: str,
+    base_operation_hash: str | None,
     before_hash: str,
     after_hash: str,
     edit: dict[str, Any],
@@ -1075,6 +1134,7 @@ def append_offline_operation(
         "document_id": document_record_id,
         "adapter": {"kind": "filesystem-text", "uri": relative_uri},
         "base_server_epoch_hash": base_server_epoch_hash,
+        "base_operation_hash": base_operation_hash,
         "operation_type": "edit",
         "document_before_hash": before_hash,
         "document_after_hash": after_hash,
@@ -1091,6 +1151,7 @@ def append_offline_operation(
     return record
 
 
+@authority_mutation
 def command_queue_offline_edit(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     paths = store_paths(root, args.store)
@@ -1141,6 +1202,7 @@ def command_queue_offline_edit(args: argparse.Namespace) -> int:
         if result.status != "unaffected":
             affected.append(str(record["partition_id"]))
     _, base_epoch_hash = last_epoch(index_records)
+    base_operation_hash = operations[-1]["operation_hash"] if operations else None
     write_text_document(source_path, new_text)
     record = append_offline_operation(
         paths,
@@ -1148,9 +1210,11 @@ def command_queue_offline_edit(args: argparse.Namespace) -> int:
         relative_uri,
         document_id(root, relative_uri),
         base_epoch_hash,
+        base_operation_hash,
         before_hash,
         after_hash,
-        edit_record(edit_start, edit_end, inserted_text) | {"inserted_text": inserted_text},
+        edit_record(edit_start, edit_end, inserted_text, args.boundary_policy)
+        | {"inserted_text": inserted_text},
         affected,
         new_text,
     )
@@ -1166,15 +1230,121 @@ def command_queue_offline_edit(args: argparse.Namespace) -> int:
     return 0
 
 
+def epoch_number_for_hash(
+    index_records: Iterable[dict[str, Any]], target_epoch_hash: str
+) -> int | None:
+    """Return the epoch number represented by a hash in the authoritative chain."""
+    if target_epoch_hash == GENESIS_EPOCH_HASH:
+        return 0
+    epochs = {
+        int(record["server_epoch"])
+        for record in index_records
+        if record.get("server_epoch_hash") == target_epoch_hash
+        and isinstance(record.get("server_epoch"), int)
+    }
+    if not epochs:
+        return None
+    if len(epochs) != 1:
+        raise DemoError("server epoch hash maps to multiple epoch numbers")
+    return next(iter(epochs))
+
+
+def validate_offline_replay_base(
+    operations: list[dict[str, Any]],
+    index_records: list[dict[str, Any]],
+    record: dict[str, Any],
+    replay_head_hash: str,
+) -> None:
+    """Allow descendant replay unless intervening authority touched the same document or partition.
+
+    Validates against both the citation-index epoch chain and the operation-log
+    suffix.  Operations that do not advance the epoch (e.g. edits outside every
+    active partition) are invisible in the index but still represent intervening
+    authority that must block replay of a conflicting offline operation.
+    """
+    base_epoch_hash = record.get("base_server_epoch_hash")
+    if not isinstance(base_epoch_hash, str):
+        raise DemoError("offline operation is missing its base server epoch hash")
+
+    base_epoch = epoch_number_for_hash(index_records, base_epoch_hash)
+    if base_epoch is None:
+        raise DemoError("offline queue base epoch is not an ancestor of the current server epoch")
+
+    current_epoch, current_epoch_hash = last_epoch(index_records)
+    if current_epoch_hash != replay_head_hash:
+        raise DemoError("server epoch changed while preparing offline replay")
+
+    queued_document_id = record.get("document_id")
+    if not isinstance(queued_document_id, str):
+        raise DemoError("offline operation is missing its document id")
+    queued_partitions = {
+        str(partition_id) for partition_id in record.get("affected_partitions", [])
+    }
+
+    # --- citation-index epoch chain check ---
+    if base_epoch < current_epoch:
+        conflicts: list[dict[str, Any]] = []
+        for index_record in index_records:
+            server_epoch = index_record.get("server_epoch")
+            if not isinstance(server_epoch, int) or server_epoch <= base_epoch:
+                continue
+            same_document = index_record.get("document_id") == queued_document_id
+            same_partition = str(index_record.get("partition_id")) in queued_partitions
+            if same_document or same_partition:
+                conflicts.append(index_record)
+        if conflicts:
+            details = ", ".join(
+                f"epoch={conflict.get('server_epoch')} "
+                f"partition={conflict.get('partition_id')} "
+                f"transition={conflict.get('transition')}"
+                for conflict in conflicts
+            )
+            raise DemoError(f"offline replay conflicts with intervening authority: {details}")
+
+    # --- operation-log suffix check (catches same-epoch operations) ---
+    if "base_operation_hash" not in record:
+        raise DemoError(
+            "legacy offline operation lacks an operation-log anchor; "
+            "requeue it before replay"
+        )
+
+    base_operation_hash = record["base_operation_hash"]
+
+    if base_operation_hash is None:
+        base_op_position = -1
+    else:
+        base_op_positions = [
+            index
+            for index, operation in enumerate(operations)
+            if operation.get("operation_hash") == base_operation_hash
+        ]
+        if len(base_op_positions) != 1:
+            raise DemoError(
+                "offline queue operation base is not an ancestor "
+                "of the current operation log"
+            )
+        base_op_position = base_op_positions[0]
+
+    for operation in operations[base_op_position + 1 :]:
+        operation_partitions = {
+            str(value)
+            for value in operation.get("affected_partitions", [])
+        }
+        same_document = operation.get("document_id") == queued_document_id
+        same_partition = bool(queued_partitions & operation_partitions)
+        if same_document or same_partition:
+            raise DemoError(
+                "offline replay conflicts with intervening "
+                f"operation {operation.get('operation_hash')}"
+            )
+
+
 def replay_offline_record(
     paths: StorePaths,
     operations: list[dict[str, Any]],
     index_records: list[dict[str, Any]],
     record: dict[str, Any],
-    initial_epoch_hash: str,
 ) -> list[str]:
-    if record.get("base_server_epoch_hash") != initial_epoch_hash:
-        raise DemoError("offline queue base epoch does not match the current server epoch")
     adapter = record.get("adapter", {})
     relative_uri = adapter.get("uri") if isinstance(adapter, dict) else None
     if not isinstance(relative_uri, str):
@@ -1186,6 +1356,9 @@ def replay_offline_record(
     inserted_text = edit.get("inserted_text")
     if not isinstance(inserted_text, str):
         raise DemoError("offline operation lacks replay text")
+    boundary_policy = edit.get("boundary_policy", "outside")
+    if boundary_policy not in {"inside", "outside"}:
+        raise DemoError(f"unsupported offline boundary policy: {boundary_policy}")
     document_after_text = record.get("document_after_text")
     if not isinstance(document_after_text, str):
         raise DemoError("offline operation lacks replay document text")
@@ -1203,7 +1376,14 @@ def replay_offline_record(
         current_epoch_hash,
         str(record["document_before_hash"]),
         str(record["document_after_hash"]),
-        [edit_record(int(edit["start"]), int(edit["end"]), inserted_text)],
+        [
+            edit_record(
+                int(edit["start"]),
+                int(edit["end"]),
+                inserted_text,
+                str(boundary_policy),
+            )
+        ],
         [str(item) for item in record.get("affected_partitions", [])],
     )
     server_epoch = current_epoch
@@ -1220,7 +1400,7 @@ def replay_offline_record(
             int(edit["start"]),
             int(edit["end"]),
             len(normalize_text(inserted_text)),
-            "outside",
+            str(boundary_policy),
         )
         if result.status != "unaffected":
             transformed.append((active, result))
@@ -1265,6 +1445,7 @@ def replay_offline_record(
     return emitted
 
 
+@authority_mutation
 def command_replay_offline(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     paths = store_paths(root, args.store)
@@ -1274,9 +1455,11 @@ def command_replay_offline(args: argparse.Namespace) -> int:
         codes = ", ".join(sorted({str(diagnostic["code"]) for diagnostic in queue_diagnostics}))
         raise DemoError(f"cannot replay invalid offline queue ({codes})")
     initial_epoch_hash = last_epoch(index_records)[1]
+    for record in queued:
+        validate_offline_replay_base(operations, index_records, record, initial_epoch_hash)
     replayed: list[str] = []
     for record in queued:
-        replayed.extend(replay_offline_record(paths, operations, index_records, record, initial_epoch_hash))
+        replayed.extend(replay_offline_record(paths, operations, index_records, record))
     if queued:
         with paths.offline_replayed.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(paths.offline_queue.read_text(encoding="utf-8"))
@@ -1605,6 +1788,7 @@ def append_state_record(
     )
 
 
+@authority_mutation
 def command_reconcile(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     paths = store_paths(root, args.store)
@@ -1661,6 +1845,7 @@ def command_reconcile(args: argparse.Namespace) -> int:
     return 0 if reconciled or args.partition_id is None else 1
 
 
+@authority_mutation
 def command_deactivate(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     paths = store_paths(root, args.store)
@@ -1695,6 +1880,7 @@ def command_deactivate(args: argparse.Namespace) -> int:
     return 0
 
 
+@authority_mutation
 def command_reactivate(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     paths = store_paths(root, args.store)
@@ -1749,6 +1935,7 @@ def command_reactivate(args: argparse.Namespace) -> int:
     return 0
 
 
+@authority_mutation
 def command_accept(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     paths = store_paths(root, args.store)
@@ -1949,6 +2136,7 @@ def command_virtual_blocks(args: argparse.Namespace) -> int:
     return 0
 
 
+@authority_mutation
 def command_import_registry(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     paths = store_paths(root, args.store)
