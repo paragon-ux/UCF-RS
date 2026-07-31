@@ -50,11 +50,15 @@ STATUS_SCHEMA = "ucf-rs.status.v1"
 RESOLVE_SCHEMA = "ucf-rs.resolve.v1"
 EXPORT_SCHEMA = "ucf-rs.export.v1"
 TRANSACTION_SCHEMA = "ucf-rs.transaction.v1"
+RECOVERY_REQUIRED_SCHEMA = "ucf-rs.recovery_required.v1"
+TRANSACTION_INSPECT_SCHEMA = "ucf-rs.transaction_inspect.v1"
+TRANSACTION_RESOLUTION_SCHEMA = "ucf-rs.transaction_resolution.v1"
 
 HANDLE_PATTERN = r"[A-Z][A-Z0-9_.-]*"
 HANDLE_RE = re.compile(rf"^{HANDLE_PATTERN}$")
 REQTRACE_MARKER_RE = re.compile(rf"@reqtrace\s+({HANDLE_PATTERN})\b")
 SHA_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+TRANSACTION_REPLACEMENT_RE = re.compile(r"^.+\.[0-9a-f]{32}\.[0-9]+\.replacement$")
 
 
 class DemoError(Exception):
@@ -243,7 +247,14 @@ def authority_mutation(command: Any) -> Any:
         root = Path(args.root).resolve()
         paths = store_paths(root, args.store)
         with authority_write_lock(paths):
-            recover_pending_transactions(paths)
+            recovery = recover_pending_transactions(paths)
+            if recovery["recovered"]:
+                output = recovery_retry_required_output(recovery)
+                if getattr(args, "format", "text") == "json":
+                    print(json.dumps(output, indent=2, sort_keys=True))
+                else:
+                    print(output["message"], file=sys.stderr)
+                return 2
             return command(args)
 
     wrapped.__name__ = command.__name__
@@ -373,6 +384,8 @@ def advance_transaction_phase(paths: StorePaths, manifest: dict[str, Any], phase
 
 
 def maybe_fail_after_transaction_phase(phase: str) -> None:
+    if os.environ.get("UCF_RS_ENABLE_FAULT_INJECTION") != "1":
+        return
     if os.environ.get("UCF_RS_CRASH_AFTER_PHASE") == phase:
         os._exit(97)
     if os.environ.get("UCF_RS_FAIL_AFTER_PHASE") == phase:
@@ -384,10 +397,11 @@ def prepare_file_transaction(
     purpose: str,
     replacements: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    if os.environ.get("UCF_RS_FAIL_AFTER_PHASE") == "before_preparation":
-        raise DemoError("fault injection before transaction preparation")
-    if os.environ.get("UCF_RS_CRASH_AFTER_PHASE") == "before_preparation":
-        os._exit(97)
+    if os.environ.get("UCF_RS_ENABLE_FAULT_INJECTION") == "1":
+        if os.environ.get("UCF_RS_FAIL_AFTER_PHASE") == "before_preparation":
+            raise DemoError("fault injection before transaction preparation")
+        if os.environ.get("UCF_RS_CRASH_AFTER_PHASE") == "before_preparation":
+            os._exit(97)
 
     transaction_id = uuid.uuid4().hex
     files: list[dict[str, Any]] = []
@@ -457,6 +471,41 @@ def read_transaction_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
+def transaction_committed_archive(paths: StorePaths) -> Path:
+    return paths.store / "transactions-committed"
+
+
+def transaction_abandoned_archive(paths: StorePaths) -> Path:
+    return paths.store / "transactions-abandoned"
+
+
+def cleanup_prepared_files(paths: StorePaths, manifest: dict[str, Any]) -> None:
+    for file_entry in manifest["files"]:
+        replacement = transaction_abs_path(paths, file_entry["replacement_path"])
+        if replacement.exists():
+            try:
+                replacement.unlink()
+            except OSError as error:
+                raise DemoError(
+                    "cannot delete transaction replacement "
+                    + file_entry["replacement_path"]
+                    + f": {error}"
+                ) from error
+
+
+def archive_manifest(paths: StorePaths, manifest_path: Path, archive_dir: Path) -> None:
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archived = archive_dir / manifest_path.name
+    os.replace(manifest_path, archived)
+    fsync_directory(archive_dir)
+    fsync_directory(paths.transactions)
+
+
+def complete_committed_manifest(paths: StorePaths, manifest: dict[str, Any], manifest_path: Path) -> None:
+    cleanup_prepared_files(paths, manifest)
+    archive_manifest(paths, manifest_path, transaction_committed_archive(paths))
+
+
 def recover_transaction_group(paths: StorePaths, manifest: dict[str, Any], role: str) -> None:
     for file_entry in manifest["files"]:
         if file_entry["role"] != role:
@@ -467,6 +516,8 @@ def recover_transaction_group(paths: StorePaths, manifest: dict[str, Any], role:
         intended_hash = str(file_entry["intended_hash"])
         expected_hash = str(file_entry["expected_hash"])
         if current_hash == intended_hash:
+            if replacement.exists():
+                cleanup_prepared_files(paths, {"files": [file_entry]})
             continue
         if current_hash != expected_hash:
             raise DemoError(
@@ -482,6 +533,7 @@ def recover_one_transaction(paths: StorePaths, manifest_path: Path) -> dict[str,
     manifest = read_transaction_manifest(manifest_path)
     phase = str(manifest["phase"])
     if phase == "committed":
+        complete_committed_manifest(paths, manifest, manifest_path)
         return {"transaction_id": manifest["transaction_id"], "phase": phase, "status": "already_committed"}
     if phase == "prepared":
         recover_transaction_group(paths, manifest, "source")
@@ -497,6 +549,8 @@ def recover_one_transaction(paths: StorePaths, manifest_path: Path) -> dict[str,
             if transaction_file_hash(read_file_bytes(target)) != file_entry["intended_hash"]:
                 raise DemoError("transaction intended hash not present: " + file_entry["path"])
         advance_transaction_phase(paths, manifest, "committed")
+        manifest = read_transaction_manifest(manifest_path)
+        complete_committed_manifest(paths, manifest, manifest_path)
         return {"transaction_id": manifest["transaction_id"], "phase": "committed", "status": "recovered"}
     raise DemoError("transaction manifest has invalid recovery phase")
 
@@ -509,9 +563,111 @@ def recover_pending_transactions(paths: StorePaths) -> dict[str, Any]:
     for manifest_path in pending_paths:
         manifest = read_transaction_manifest(manifest_path)
         if manifest.get("phase") == "committed":
+            complete_committed_manifest(paths, manifest, manifest_path)
             continue
         recovered.append(recover_one_transaction(paths, manifest_path))
     return {"schema_version": "ucf-rs.recovery.v1", "recovered": recovered, "pending": 0}
+
+
+def recovery_retry_required_output(recovery: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": RECOVERY_REQUIRED_SCHEMA,
+        "code": "E_RECOVERY_RETRY_REQUIRED",
+        "message": (
+            "pending transaction recovery completed; inspect current state and retry "
+            "the command with fresh preconditions"
+        ),
+        "recovery": recovery,
+    }
+
+
+def transaction_file_observation(paths: StorePaths, file_entry: dict[str, Any]) -> dict[str, Any]:
+    target = transaction_abs_path(paths, file_entry["path"])
+    current_hash = transaction_file_hash(read_file_bytes(target))
+    expected_hash = str(file_entry["expected_hash"])
+    intended_hash = str(file_entry["intended_hash"])
+    if current_hash == intended_hash:
+        status = "intended"
+    elif current_hash == expected_hash:
+        status = "expected"
+    else:
+        status = "diverged"
+    replacement = transaction_abs_path(paths, file_entry["replacement_path"])
+    return {
+        "role": file_entry["role"],
+        "path": file_entry["path"],
+        "replacement_path": file_entry["replacement_path"],
+        "target_exists": target.exists(),
+        "replacement_exists": replacement.exists(),
+        "current_hash": current_hash,
+        "expected_hash": expected_hash,
+        "intended_hash": intended_hash,
+        "status": status,
+    }
+
+
+def inspect_transaction_manifest(paths: StorePaths, manifest_path: Path) -> dict[str, Any]:
+    manifest = read_transaction_manifest(manifest_path)
+    files = [transaction_file_observation(paths, entry) for entry in manifest["files"]]
+    resolvable_actions: list[str] = []
+    if manifest.get("phase") != "committed":
+        if any(file["status"] == "intended" for file in files):
+            resolvable_actions.append("recover")
+        else:
+            resolvable_actions.extend(["recover", "abandon"])
+    return {
+        "transaction_id": manifest["transaction_id"],
+        "purpose": manifest["purpose"],
+        "phase": manifest["phase"],
+        "created_at": manifest.get("created_at"),
+        "path": relative_path(paths.root, manifest_path),
+        "files": files,
+        "resolvable_actions": resolvable_actions,
+    }
+
+
+def inspect_transactions(paths: StorePaths, transaction_id: str | None = None) -> list[dict[str, Any]]:
+    if not paths.transactions.exists():
+        return []
+    manifest_paths = sorted(paths.transactions.glob("*.json"))
+    if transaction_id:
+        manifest_paths = [path for path in manifest_paths if path.stem == transaction_id]
+        if not manifest_paths:
+            raise DemoError(f"transaction not found: {transaction_id}")
+    return [inspect_transaction_manifest(paths, path) for path in manifest_paths]
+
+
+def abandon_transaction(paths: StorePaths, transaction_id: str, reason: str) -> dict[str, Any]:
+    manifest_path = transaction_manifest_path(paths, transaction_id)
+    if not manifest_path.exists():
+        raise DemoError(f"transaction not found: {transaction_id}")
+    inspection = inspect_transaction_manifest(paths, manifest_path)
+    if inspection["phase"] == "committed":
+        manifest = read_transaction_manifest(manifest_path)
+        complete_committed_manifest(paths, manifest, manifest_path)
+        raise DemoError("transaction is already committed; committed manifest was archived")
+    intended = [file["path"] for file in inspection["files"] if file["status"] == "intended"]
+    if intended:
+        raise DemoError(
+            "cannot abandon transaction after intended bytes are present; run recover instead: "
+            + ", ".join(intended)
+        )
+    manifest = read_transaction_manifest(manifest_path)
+    cleanup_prepared_files(paths, manifest)
+    resolution = {
+        "schema_version": TRANSACTION_RESOLUTION_SCHEMA,
+        "transaction_id": transaction_id,
+        "resolution": "abandoned",
+        "reason": reason,
+        "resolved_at": utc_now(),
+        "inspection": inspection,
+    }
+    archive = transaction_abandoned_archive(paths)
+    archive.mkdir(parents=True, exist_ok=True)
+    write_json_durable(archive / f"{transaction_id}.json", resolution)
+    manifest_path.unlink()
+    fsync_directory(paths.transactions)
+    return resolution
 
 
 def pending_transaction_diagnostics(paths: StorePaths) -> list[dict[str, Any]]:
@@ -2086,6 +2242,8 @@ def iter_text_files(root: Path, paths: StorePaths) -> Iterable[Path]:
             continue
         if any(part in excluded for part in path.relative_to(root).parts):
             continue
+        if TRANSACTION_REPLACEMENT_RE.match(path.name):
+            continue
         if is_within_store(path, paths):
             continue
         try:
@@ -2305,6 +2463,36 @@ def command_recover(args: argparse.Namespace) -> int:
         print(json.dumps(output, indent=2, sort_keys=True))
     else:
         print(f"recovered {len(output['recovered'])} transaction(s)")
+    return 0
+
+
+def command_transaction_inspect(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    paths = store_paths(root, args.store)
+    output = {
+        "schema_version": TRANSACTION_INSPECT_SCHEMA,
+        "transactions": inspect_transactions(paths, args.transaction_id),
+    }
+    if args.format == "json":
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        for transaction in output["transactions"]:
+            print(
+                f"{transaction['transaction_id']} phase={transaction['phase']} "
+                f"actions={','.join(transaction['resolvable_actions'])}"
+            )
+    return 0
+
+
+def command_transaction_abandon(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    paths = store_paths(root, args.store)
+    with authority_write_lock(paths):
+        output = abandon_transaction(paths, args.transaction_id, args.reason)
+    if args.format == "json":
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        print(f"abandoned {args.transaction_id}")
     return 0
 
 
@@ -2643,6 +2831,19 @@ def command_accept(args: argparse.Namespace) -> int:
     if current_hash != record.get("current_content_hash"):
         raise DemoError("current content hash does not match the latest managed range")
     observed = partition_status(root, paths, record)
+    if observed.get("action") == "none":
+        output = {
+            "partition_id": args.partition_id,
+            "accepted_content_hash": record["accepted_content_hash"],
+            "index_record_hash": record["index_record_hash"],
+            "server_epoch_hash": record["server_epoch_hash"],
+            "status": "unchanged",
+        }
+        if args.format == "json":
+            print(json.dumps(output, indent=2, sort_keys=True))
+        else:
+            print(f"accepted {args.partition_id}")
+        return 0
     if observed.get("action") not in {"accept_current", "confirm_boundary"}:
         raise DemoError(
             "partition state is not acceptable; current action is "
@@ -2943,10 +3144,10 @@ def command_json_result(command: Any, args: argparse.Namespace) -> dict[str, Any
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
         rc = command(args)
-    if rc != 0:
-        raise DemoError(f"command failed with exit code {rc}")
     text = output.getvalue().strip()
     if not text:
+        if rc != 0:
+            raise DemoError(f"command failed with exit code {rc}")
         return {"exit_code": rc}
     try:
         result = json.loads(text)
@@ -2954,6 +3155,11 @@ def command_json_result(command: Any, args: argparse.Namespace) -> dict[str, Any
         raise DemoError(f"command did not emit JSON: {text}") from error
     if not isinstance(result, dict):
         raise DemoError("command JSON result must be an object")
+    if rc != 0:
+        if result.get("code") == "E_RECOVERY_RETRY_REQUIRED":
+            result["exit_code"] = rc
+            return result
+        raise DemoError(f"command failed with exit code {rc}")
     return result
 
 
@@ -3325,6 +3531,21 @@ def build_parser() -> argparse.ArgumentParser:
     recover = subcommands.add_parser("recover", help="complete pending recoverable transactions")
     recover.add_argument("--format", choices=("text", "json"), default="text")
     recover.set_defaults(func=command_recover)
+
+    transaction = subcommands.add_parser("transaction", help="inspect or resolve pending file transactions")
+    transaction_subcommands = transaction.add_subparsers(dest="transaction_command", required=True)
+    transaction_inspect = transaction_subcommands.add_parser("inspect", help="inspect pending transaction state")
+    transaction_inspect.add_argument("--transaction-id")
+    transaction_inspect.add_argument("--format", choices=("text", "json"), default="text")
+    transaction_inspect.set_defaults(func=command_transaction_inspect)
+    transaction_abandon = transaction_subcommands.add_parser(
+        "abandon",
+        help="archive an unapplied divergent transaction after explicit inspection",
+    )
+    transaction_abandon.add_argument("--transaction-id", required=True)
+    transaction_abandon.add_argument("--reason", required=True)
+    transaction_abandon.add_argument("--format", choices=("text", "json"), default="text")
+    transaction_abandon.set_defaults(func=command_transaction_abandon)
 
     export_ledger = subcommands.add_parser("export-ledger", help="write deterministic audit JSONL")
     export_ledger.add_argument("--output", default=EXPORT_LEDGER_DEFAULT)

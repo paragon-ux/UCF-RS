@@ -16,7 +16,9 @@ projections over that authority.
 | `.ucf-rs/offline-queue.jsonl` | Local replay authority | Pending disconnected edits, affected/refreshed partition context, replay text, and queue chain hash. | Each record is hashed as `ucf.offline_operation.v1`; this hash is separate from operation/index canonical hashes. |
 | `.ucf-rs/offline-replayed.jsonl` | Local replay archive | Consumed offline queue records after successful replay. | Archive records retain their offline hashes; they are not accepted evidence and do not alter operation/index hash domains. |
 | `.ucf-rs/snapshots/` | Reserved operational storage | Local runtime snapshots when present. | Provider/runtime data only; not canonical citation authority. |
-| `.ucf-rs/transactions/*.json` | Recoverable consistency metadata | Pending and committed file transaction manifests for source-plus-authority writes. | Transaction file hashes use `ucf.transaction_file.v1` and are outside operation/index canonical hashes. |
+| `.ucf-rs/transactions/*.json` | Hot recoverable consistency metadata | Pending file transaction manifests for source-plus-authority writes. | Transaction file hashes use `ucf.transaction_file.v1` and are outside operation/index canonical hashes. |
+| `.ucf-rs/transactions-committed/*.json` | Transaction recovery archive | Committed manifests after prepared-file cleanup. | Archived records are not scanned during the mutation/status hot path and are outside operation/index canonical hashes. |
+| `.ucf-rs/transactions-abandoned/*.json` | Explicit transaction-resolution archive | Operator-approved abandonment records for unapplied divergent transactions. | Archive records preserve inspection evidence and are outside operation/index canonical hashes. |
 | `docs/ucf-trace-ledger.jsonl` | Generated projection | Deterministic audit ledger export. | The file content may be hashed as `ucf.export_ledger.v1`; it is not source authority. |
 | `docs/ucf-trace-status.json` | Generated projection | Rendered status report. | Rebuildable from source projection and `.ucf-rs/` authority. |
 | `docs/ucf-trace-report.md` | Generated projection | Human-readable status report. | Rebuildable and non-authoritative. |
@@ -95,9 +97,18 @@ Transaction manifests are stored below `.ucf-rs/transactions/` and use
 - intended file hashes after replacement.
 
 Recovery recognizes already completed phases from actual file hashes and
-continues forward. Malformed manifests, missing replacements, or target
-divergence fail closed. Committed manifests may remain as operational recovery
-history, but they are not part of canonical operation or citation-index hashes.
+continues forward. Residual prepared replacement files are deleted once the
+target has the intended hash, and committed manifests are moved to
+`.ucf-rs/transactions-committed/` after cleanup so hot recovery cost stays
+proportional to pending work. Replacement filenames are excluded from exact
+source-recovery scanning.
+
+Malformed manifests, missing replacements, or target divergence fail closed.
+For divergence, `transaction inspect` reports file-level expected, intended, and
+current hashes. `transaction abandon` may archive a resolution only when no
+target contains the transaction's intended bytes; afterward, source status is
+computed from the current filesystem and authority records. Manual deletion of
+hot manifests is not the recovery procedure.
 
 ## UCF-Yjs Behavior Matrix
 

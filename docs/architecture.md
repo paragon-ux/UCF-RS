@@ -28,7 +28,11 @@ Managed source-plus-authority writes use recoverable file transactions under
 `.ucf-rs/transactions/`. A transaction records prepared, source-applied,
 authority-applied, and committed phases plus expected and intended file hashes.
 Recovery is idempotent and completes prepared replacements with `os.replace`.
-This is recoverable consistency, not a claim of cross-file atomicity.
+If a mutating command performs implicit recovery, it returns a retry-required
+outcome without executing the requested mutation; callers inspect current state
+before issuing a fresh command. Divergent transactions require explicit
+inspection and bounded resolution rather than manual manifest deletion. This is
+recoverable consistency, not a claim of cross-file atomicity.
 
 Generated exports remain non-authoritative. `status --strict` reports stale
 exported ledgers when `docs/ucf-trace-ledger.jsonl` no longer matches current

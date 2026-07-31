@@ -14,6 +14,8 @@ Core commands:
 - `resolve` / `citations`: emit overlays for a document.
 - `status`: validate authority records and current projection.
 - `recover`: complete pending recoverable transactions and emit structured recovery output.
+- `transaction inspect`: inspect pending transaction phase, file hashes, and supported resolution actions.
+- `transaction abandon`: archive an unapplied divergent transaction after explicit operator inspection.
 - `export ledger` / `export blocks`: write deterministic audit projections.
 - `render`: write generated status JSON and Markdown report.
 - `discover-reqtrace`: list advisory brownfield `@reqtrace` markers.
@@ -48,7 +50,26 @@ replay appends the queue content to `.ucf-rs/offline-replayed.jsonl` and clears
 the pending queue.
 
 `apply-edit`, `queue-offline-edit`, and `replay-offline` use recoverable file
-transactions for source-plus-authority consistency. Mutating commands recover
-pending transactions before reading mutable authority. Read-only status reports
-pending or malformed transactions as strict failures until `recover` completes
-or returns a stable diagnostic.
+transactions for source-plus-authority consistency. Mutating commands first
+complete any recoverable pending transaction under the authority lock. If that
+implicit recovery completes work, the requested mutation stops before execution
+and JSON mode returns `ucf-rs.recovery_required.v1` with
+`E_RECOVERY_RETRY_REQUIRED`. The caller must inspect current state and issue a
+new command with fresh preconditions. The same structured result is returned
+through `serve` for mutating request methods.
+
+After a transaction reaches `committed`, but before the caller observes the
+command response, the command outcome is intentionally uncertain. Callers must
+inspect current state, status, and operation/index records instead of blindly
+replaying a non-idempotent command.
+
+If recovery fails because a target file matches neither the expected nor the
+intended transaction hash, `transaction inspect --format json` reports each
+file's current hash and status. `transaction abandon --transaction-id ID
+--reason TEXT` is only allowed while no target contains intended transaction
+bytes; it archives the resolution outside the hot recovery path and leaves
+source/status to report the current filesystem state. If any intended bytes are
+present, use `recover` rather than abandon.
+
+Fault-injection environment variables are ignored unless
+`UCF_RS_ENABLE_FAULT_INJECTION=1` is also set. They are test/debug hooks only.
