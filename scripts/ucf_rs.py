@@ -720,7 +720,22 @@ def operation_partition_set(operation: dict[str, Any], field: str) -> set[str]:
     values = operation.get(field, [])
     if not isinstance(values, list):
         return set()
-    return {str(value) for value in values}
+    return {value for value in values if isinstance(value, str)}
+
+
+def index_operation_coverage_error(
+    paths: StorePaths,
+    line_number: int,
+    transition: object,
+    operation_field: str,
+) -> dict[str, Any]:
+    return {
+        "code": "E_INDEX_OPERATION_COVERAGE",
+        "severity": "fatal",
+        "message": f"{transition} index record is not covered by operation {operation_field}",
+        "path": relative_path(paths.root, paths.index),
+        "line": line_number,
+    }
 
 
 def index_operation_coverage_diagnostic(
@@ -729,24 +744,25 @@ def index_operation_coverage_diagnostic(
     index_record: dict[str, Any],
     operation_record: dict[str, Any],
 ) -> dict[str, Any] | None:
-    operation_type = operation_record.get("operation_type")
     transition = index_record.get("transition")
     operation_field: str | None = None
-    if operation_type == "edit" and transition == "edit-transform":
+    if transition == "edit-transform":
         operation_field = "affected_partitions"
-    elif operation_type == "edit" and transition == "edit-refresh":
+    elif transition == "edit-refresh":
         operation_field = "refreshed_partitions"
     if operation_field is None:
         return None
+    if operation_record.get("operation_type") != "edit":
+        return index_operation_coverage_error(paths, line_number, transition, operation_field)
     partition_id = index_record.get("partition_id")
-    if not isinstance(partition_id, str) or partition_id not in operation_partition_set(operation_record, operation_field):
-        return {
-            "code": "E_INDEX_OPERATION_COVERAGE",
-            "severity": "fatal",
-            "message": f"{transition} index record is not covered by operation {operation_field}",
-            "path": relative_path(paths.root, paths.index),
-            "line": line_number,
-        }
+    values = operation_record.get(operation_field)
+    if (
+        not isinstance(values, list)
+        or not all(isinstance(value, str) for value in values)
+        or not isinstance(partition_id, str)
+        or partition_id not in values
+    ):
+        return index_operation_coverage_error(paths, line_number, transition, operation_field)
     return None
 
 
@@ -2333,7 +2349,7 @@ def require_latest_active(index_records: list[dict[str, Any]], partition_id: str
     return record
 
 
-def append_state_record(
+def build_state_records(
     paths: StorePaths,
     operations: list[dict[str, Any]],
     index_records: list[dict[str, Any]],
@@ -2347,7 +2363,7 @@ def append_state_record(
     accepted_hash: str,
     current_hash: str,
     transform_status: str,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any], str]:
     current_epoch, current_epoch_hash = last_epoch(index_records)
     document_record_id = document_id(paths.root, relative_uri) if relative_uri else str(record["document_id"])
     operation_record = build_operation_record(
@@ -2385,6 +2401,39 @@ def append_state_record(
         evidence.get("line_count") if isinstance(evidence, dict) else None,
         evidence.get("byte_count") if isinstance(evidence, dict) else None,
     )
+    return operation_record, index_record, new_epoch_hash
+
+
+def append_state_record(
+    paths: StorePaths,
+    operations: list[dict[str, Any]],
+    index_records: list[dict[str, Any]],
+    record: dict[str, Any],
+    transition: str,
+    state: str,
+    relative_uri: str,
+    selected_range: Range,
+    current_text: str,
+    document_revision: str,
+    accepted_hash: str,
+    current_hash: str,
+    transform_status: str,
+) -> dict[str, Any]:
+    operation_record, index_record, _ = build_state_records(
+        paths,
+        operations,
+        index_records,
+        record,
+        transition,
+        state,
+        relative_uri,
+        selected_range,
+        current_text,
+        document_revision,
+        accepted_hash,
+        current_hash,
+        transform_status,
+    )
     run_authority_record_transaction(paths, transition, [operation_record], [index_record])
     operations.append(operation_record)
     index_records.append(index_record)
@@ -2404,6 +2453,11 @@ def command_reconcile(args: argparse.Namespace) -> int:
         if partition.get("status") == "valid_moved"
     }
     reconciled: list[str] = []
+    operation_records: list[dict[str, Any]] = []
+    index_records_to_append: list[dict[str, Any]] = []
+    document_records: list[dict[str, Any]] = []
+    future_operations = list(operations)
+    future_index_records = list(index_records)
     for partition in report["partitions"]:
         partition_id = str(partition["partition_id"])
         if partition_id not in requested or partition.get("status") != "valid_moved":
@@ -2423,10 +2477,10 @@ def command_reconcile(args: argparse.Namespace) -> int:
         current_text = text[selected_range.start : selected_range.end]
         current_hash = content_hash_text(current_text)
         doc_hash = document_hash_text(text)
-        append_state_record(
+        operation_record, index_record, new_epoch_hash = build_state_records(
             paths,
-            operations,
-            index_records,
+            future_operations,
+            future_index_records,
             record,
             "relocate",
             "active",
@@ -2438,15 +2492,26 @@ def command_reconcile(args: argparse.Namespace) -> int:
             current_hash,
             "valid",
         )
+        future_operations.append(operation_record)
+        future_index_records.append(index_record)
+        operation_records.append(operation_record)
+        index_records_to_append.append(index_record)
         document_record = build_document_record(
             paths,
             relative_uri,
             document_id(root, relative_uri),
             doc_hash,
-            last_epoch(index_records)[1],
+            new_epoch_hash,
         )
-        run_authority_record_transaction(paths, "relocate-document", document_records=[document_record])
+        document_records.append(document_record)
         reconciled.append(partition_id)
+    run_authority_record_transaction(
+        paths,
+        "reconcile",
+        operation_records,
+        index_records_to_append,
+        document_records,
+    )
     output = {"reconciled": reconciled, "count": len(reconciled)}
     if args.format == "json":
         print(json.dumps(output, indent=2, sort_keys=True))

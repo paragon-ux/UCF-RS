@@ -49,6 +49,38 @@ class UcfRsDemoTests(unittest.TestCase):
     def jsonl(self, path: Path) -> list[dict[str, object]]:
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
+    def write_jsonl(self, path: Path, records: list[dict[str, object]]) -> None:
+        self.write(
+            path,
+            "\n".join(
+                json.dumps(record, sort_keys=True, separators=(",", ":"))
+                for record in records
+            )
+            + "\n",
+        )
+
+    def rewrite_second_operation_and_index(
+        self,
+        root: Path,
+        operation_update: dict[str, object],
+    ) -> None:
+        operation_path = root / ".ucf-rs" / "operation-log.jsonl"
+        index_path = root / ".ucf-rs" / "citation-index.jsonl"
+        operations = self.jsonl(operation_path)
+        index = self.jsonl(index_path)
+        operations[1].update(operation_update)
+        operations[1].pop("operation_hash")
+        operations[1]["operation_hash"] = ucf.operation_hash(operations[1])
+        index[1]["operation_hash"] = operations[1]["operation_hash"]
+        index[1]["server_epoch_hash"] = ucf.epoch_hash(
+            index[0]["server_epoch_hash"],
+            operations[1]["operation_hash"],
+        )
+        index[1].pop("index_record_hash")
+        index[1]["index_record_hash"] = ucf.index_record_hash(index[1])
+        self.write_jsonl(operation_path, operations)
+        self.write_jsonl(index_path, index)
+
     def run_json(self, argv: list[str]) -> dict[str, object]:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -351,6 +383,37 @@ class UcfRsDemoTests(unittest.TestCase):
             reconciled = self.status(root)
             self.assertEqual(reconciled["summary"], {"valid": 1})
             self.assertEqual(reconciled["partitions"][0]["adapter"]["uri"], "src/moved_auth.py")
+
+    def test_reconcile_commits_relocation_and_document_record_atomically(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            paths = ucf.store_paths(root, ucf.STORE_DEFAULT)
+            original = root / "src" / "auth.py"
+            moved = root / "src" / "moved_auth.py"
+            self.write(original, "header\nalpha\nbeta\n")
+            self.assertEqual(self.activate(root, "src/auth.py", "2:3"), 0)
+            self.write(original, "header\n")
+            self.write(moved, "alpha\nbeta\n")
+            self.assertEqual(self.status(root)["summary"], {"valid_moved": 1})
+
+            operation_count = len(self.jsonl(paths.operations))
+            index_count = len(self.jsonl(paths.index))
+            document_count = len(self.jsonl(paths.documents))
+            with self.fault_phase("committed"):
+                rc = ucf.main(["--root", str(root), "reconcile", "--partition-id", "AUTH-ROTATE/001"])
+            self.assertEqual(rc, 2)
+
+            self.assertEqual(len(self.jsonl(paths.operations)), operation_count + 1)
+            self.assertEqual(len(self.jsonl(paths.index)), index_count + 1)
+            self.assertEqual(len(self.jsonl(paths.documents)), document_count + 1)
+            self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 0)
+            self.assertEqual(
+                ucf.main(["--root", str(root), "reconcile", "--partition-id", "AUTH-ROTATE/001"]),
+                1,
+            )
+            self.assertEqual(len(self.jsonl(paths.operations)), operation_count + 1)
+            self.assertEqual(len(self.jsonl(paths.index)), index_count + 1)
+            self.assertEqual(len(self.jsonl(paths.documents)), document_count + 1)
 
     def test_lifecycle_deactivate_and_reactivate(self) -> None:
         with self.make_root() as directory:
@@ -676,6 +739,134 @@ class UcfRsDemoTests(unittest.TestCase):
 
             status = self.status(root)
             codes = {diagnostic["code"] for diagnostic in status["diagnostics"]}
+            self.assertIn("E_INDEX_OPERATION_COVERAGE", codes)
+            self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 1)
+
+    def test_edit_transform_index_requires_edit_operation_type(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            original = "alpha\nbeta\n"
+            self.write(source, original)
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "apply-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        str(original.index("beta")),
+                        "--end",
+                        str(original.index("beta")),
+                        "--insert",
+                        "new-",
+                    ]
+                ),
+                0,
+            )
+
+            self.rewrite_second_operation_and_index(root, {"operation_type": "activate"})
+
+            codes = {diagnostic["code"] for diagnostic in self.status(root)["diagnostics"]}
+            self.assertIn("E_INDEX_OPERATION_COVERAGE", codes)
+            self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 1)
+
+    def test_edit_refresh_index_requires_edit_operation_type(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            original = "alpha\nbeta\n"
+            self.write(source, original)
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "apply-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        str(len(original)),
+                        "--end",
+                        str(len(original)),
+                        "--insert",
+                        "tail\n",
+                    ]
+                ),
+                0,
+            )
+
+            self.rewrite_second_operation_and_index(root, {"operation_type": "activate"})
+
+            codes = {diagnostic["code"] for diagnostic in self.status(root)["diagnostics"]}
+            self.assertIn("E_INDEX_OPERATION_COVERAGE", codes)
+            self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 1)
+
+    def test_edit_transform_operation_partition_fields_must_be_strings(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            original = "alpha\nbeta\n"
+            self.write(source, original)
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "apply-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        str(original.index("beta")),
+                        "--end",
+                        str(original.index("beta")),
+                        "--insert",
+                        "new-",
+                    ]
+                ),
+                0,
+            )
+
+            self.rewrite_second_operation_and_index(root, {"affected_partitions": [123]})
+
+            codes = {diagnostic["code"] for diagnostic in self.status(root)["diagnostics"]}
+            self.assertIn("E_INDEX_OPERATION_COVERAGE", codes)
+            self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 1)
+
+    def test_edit_refresh_operation_partition_fields_must_be_strings(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            original = "alpha\nbeta\n"
+            self.write(source, original)
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "apply-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        str(len(original)),
+                        "--end",
+                        str(len(original)),
+                        "--insert",
+                        "tail\n",
+                    ]
+                ),
+                0,
+            )
+
+            self.rewrite_second_operation_and_index(root, {"refreshed_partitions": [123]})
+
+            codes = {diagnostic["code"] for diagnostic in self.status(root)["diagnostics"]}
             self.assertIn("E_INDEX_OPERATION_COVERAGE", codes)
             self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 1)
 
