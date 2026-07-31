@@ -1,11 +1,13 @@
 # UCF-RS
 
-UCF-RS is a separate experimental repository for the overlay-first architecture
-that grew out of Reqtrace v2.1.7's evidence discipline.
+UCF-RS is a standalone local runtime for source-clean traceability. The
+`0.1.0` Git tag marks the foundation-hardening baseline: explicit citation
+authority, append-only mutation records, recoverable source-plus-authority
+transactions, and project-level validation.
 
-Reqtrace remains the grep-native v2.1.7 evidence convention. UCF-RS explores a
-different architecture: source files stay clean, citations are rendered as
-overlays, and authority lives in a durable citation index plus operation log.
+UCF-RS is separate from Reqtrace. Reqtrace remains the grep-native v2.1.7
+evidence convention; UCF-RS keeps source files clean, renders citations as
+overlays, and stores authority in a durable citation index plus operation log.
 
 ## Quickstart
 
@@ -19,6 +21,19 @@ python scripts/ucf_rs.py render
 ```
 
 The CLI uses only Python's standard library.
+
+## Repository Status
+
+- Local authority is stored under `.ucf-rs/`; generated ledgers and reports are
+  deterministic projections, not authority.
+- Mutating commands append operation and citation-index records instead of
+  inferring evidence from surrounding source context.
+- Managed source edits, offline queue writes, replay, lifecycle transitions,
+  and reconcile flows use recoverable file transactions.
+- Local HTTP serving is loopback-only by default, has bounded request bodies,
+  and has no authentication or TLS claim.
+- UCF-YJS may use UCF-RS as a conformance reference, but it must not depend on
+  UCF-RS internals, storage layouts, or hashes.
 
 ## What Is Implemented
 
@@ -39,6 +54,8 @@ The CLI uses only Python's standard library.
 
 - [Storage schemas](docs/storage-schemas.md) define authoritative files, derived projections, canonical hash boundaries, schema failure behavior, and the UCF-Yjs conformance matrix.
 - [Data handling policy](docs/data-policy.md) defines retention, visibility, export, source/evidence disclosure, diagnostic redaction, backups, deletion, and local HTTP exposure.
+- [Architecture](docs/architecture.md) and [commands](docs/commands.md) describe
+  the runtime model and CLI/API surface.
 
 ## Validation
 
