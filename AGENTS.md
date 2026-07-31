@@ -1,5 +1,8 @@
 # Agent Guidance
 
+This file is for agents modifying UCF-RS itself. Agents using UCF-RS as a
+citation tool in another project should read `docs/agent-guide.md`.
+
 UCF-RS is separate from Reqtrace. Keep the implementation local, explicit, and
 append-only.
 
