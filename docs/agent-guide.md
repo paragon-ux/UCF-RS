@@ -87,8 +87,12 @@ Request shape (simple or JSON-RPC-compatible):
 ```
 
 ```json
-{"jsonrpc": "2.0", "id": "1", "method": "partition.activate", "params": {"handle": "AUTH-ROTATE", "path": "src/auth.py", "lines": "1:4"}}
+{"jsonrpc": "2.0", "id": "1", "method": "partition.activate", "params": {"handle": "AUTH-ROTATE", "path": "src/auth.py", "lines": "1:4", "task_context": true}}
 ```
+
+(`lines` uses the same `"START:END"` string format as the CLI's `--lines`.
+`task_context` is the server equivalent of `--task-context` — set it `true`
+when the handle isn't already in `docs/handle-registry.jsonl`.)
 
 Available methods:
 
@@ -114,15 +118,23 @@ explicitly opted into `--unsafe-remote` and understands the exposure.
 
 ```bash
 python scripts/ucf_rs.py init
-python scripts/ucf_rs.py preflight --handle AUTH-ROTATE --path src/auth.py --lines 1:4
-python scripts/ucf_rs.py activate --handle AUTH-ROTATE --path src/auth.py --lines 1:4
+python scripts/ucf_rs.py preflight --handle AUTH-ROTATE --path src/auth.py --lines 1:4 --task-context
+python scripts/ucf_rs.py activate --handle AUTH-ROTATE --path src/auth.py --lines 1:4 --task-context
 python scripts/ucf_rs.py status --format json
+# note the partition_id in the activate/status output, e.g. AUTH-ROTATE/001 —
+# lifecycle commands key off that, not the handle
 # ... later, after the file changes ...
 python scripts/ucf_rs.py resolve --path src/auth.py
 # if changed_unaccepted and confirmed correct:
 python scripts/ucf_rs.py accept --partition-id AUTH-ROTATE/001
 python scripts/ucf_rs.py export ledger
 ```
+
+Omit `--task-context` once the handle is already registered in
+`docs/handle-registry.jsonl` — without it and without a registry entry,
+`activate`/`preflight` exit non-zero with a plain-text error on stderr (not
+JSON, even under `--format json`), so check the exit code rather than only
+trying to parse stdout.
 
 ## See also
 

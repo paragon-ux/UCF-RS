@@ -2,6 +2,6 @@
   "implementation": "scripts/ucf_rs.py",
   "schema_version": "ucf-rs.repo_export.v1",
   "selected_direction": "UCF-RS",
-  "source": "C:\\Users\\USER\\Desktop\\Frameworks\\Reqtrace",
+  "source": "Reqtrace",
   "tests": "tests/test_ucf_rs.py"
 }

@@ -4,7 +4,7 @@ This review compares the three local v3 directions and records the demo choice.
 
 ## 1. Unoptimized Track-Block Runtime
 
-Source: `C:\Users\USER\Desktop\Frameworks\Reqtrace-Archival\reqtrace-v3-non-selected\unoptimized-track-v3\`.
+Source: archived Reqtrace v3 `unoptimized-track-v3` direction.
 
 This direction moves Reqtrace from single-line occurrence markers to
 source-visible track blocks and an append-only requirements ledger. It is a good
@@ -39,7 +39,7 @@ Verdict: best overall v3 user-facing architecture and the corrected demo target.
 
 ## 3. Optimized Block/Snapshot/Artifact Standard
 
-Source: `C:\Users\USER\Desktop\Frameworks\Reqtrace-Archival\reqtrace-v3-non-selected\block-snapshot-v3\`.
+Source: archived Reqtrace v3 `block-snapshot-v3` direction.
 
 This direction is the most promising near-term path. It keeps the authority
 model local and audit-friendly while acknowledging the real tradeoff: no single

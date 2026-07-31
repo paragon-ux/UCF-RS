@@ -38,8 +38,11 @@ Requires Python 3.10+ (standard library only — nothing to install).
 # From your project root
 python scripts/ucf_rs.py init
 
-# Cite lines 1-4 of a file under a stable handle
-python scripts/ucf_rs.py activate --handle AUTH-ROTATE --path src/auth.py --lines 1:4
+# Cite lines 1-4 of a file under a stable handle.
+# --task-context registers the handle on the fly; omit it once the handle
+# is already tracked in docs/handle-registry.jsonl (see "Handles and
+# partitions" in the User Guide).
+python scripts/ucf_rs.py activate --handle AUTH-ROTATE --path src/auth.py --lines 1:4 --task-context
 
 # See current citation status
 python scripts/ucf_rs.py status --format json
@@ -54,8 +57,9 @@ python scripts/ucf_rs.py export ledger
 python scripts/ucf_rs.py render
 ```
 
-A runnable end-to-end example lives in
-[`examples/managed-edit/`](examples/managed-edit/).
+A runnable end-to-end example — pre-registered handle, no `--task-context`
+needed — lives in [`examples/managed-edit/`](examples/managed-edit/); run its
+three commands from inside that directory.
 
 ## Who this is for
 

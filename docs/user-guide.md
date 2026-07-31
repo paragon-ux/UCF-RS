@@ -55,16 +55,37 @@ so you're not starting from zero.
 
 ### 2. Activate a citation
 
+`activate` requires the handle to already be known — either imported from a
+`docs/handle-registry.jsonl` (Reqtrace-compatible), or supplied explicitly
+for this task with `--task-context`:
+
 ```bash
-python scripts/ucf_rs.py activate --handle AUTH-ROTATE --path src/auth.py --lines 1:4
+python scripts/ucf_rs.py activate --handle AUTH-ROTATE --path src/auth.py --lines 1:4 --task-context
 ```
 
 This accepts an explicit line range under a stable handle. It does not
 modify `src/auth.py`. Use `preflight` first if you want to validate an
-activation without writing anything:
+activation without writing anything (same flags, including `--task-context`
+if needed):
 
 ```bash
-python scripts/ucf_rs.py preflight --handle AUTH-ROTATE --path src/auth.py --lines 1:4
+python scripts/ucf_rs.py preflight --handle AUTH-ROTATE --path src/auth.py --lines 1:4 --task-context
+```
+
+### Handles and partitions
+
+A **handle** (`AUTH-ROTATE`) is a stable, human-chosen name — usually one per
+requirement or concern. Each `activate` call under a handle creates a new
+**partition** with its own ID, numbered sequentially:
+`AUTH-ROTATE/001`, `AUTH-ROTATE/002`, and so on. `activate` output includes
+this `partition_id`.
+
+Lifecycle commands (`accept`, `deactivate`, `reactivate`, `reconcile`) key
+off the **partition ID**, not the handle, since a handle can cover several
+active ranges at once:
+
+```bash
+python scripts/ucf_rs.py accept --partition-id AUTH-ROTATE/001
 ```
 
 ### 3. Check status
@@ -91,7 +112,7 @@ the file as it exists right now and reports each one's status.
 - **active / valid** — the cited range still matches what was recorded.
 - **changed_unaccepted** — the underlying text changed since activation or
   last acceptance. UCF-RS will not treat this as valid evidence until you
-  explicitly resolve it.
+  explicitly `accept` it (or reconcile/reactivate it, as appropriate).
 - **inactive** — deactivated via `deactivate`.
 - **missing / ambiguous** — the target can't be found, or more than one
   candidate location fits. Neither is auto-accepted.
@@ -118,11 +139,16 @@ as text is inserted or removed:
 python scripts/ucf_rs.py apply-edit --path src/auth.py --start 0 --end 0 --insert "# rotated\n"
 ```
 
+(`--start`/`--end` are Unicode-scalar offsets into the file, not line
+numbers — `resolve`'s output shows both.)
+
 If a file was edited outside UCF-RS and evidence moved but is otherwise
-unchanged, `reconcile` can recover exact moves from accepted line hashes:
+unchanged, `reconcile` can recover exact moves from accepted line hashes.
+Run it project-wide, or scope it to one partition:
 
 ```bash
-python scripts/ucf_rs.py reconcile --path src/auth.py
+python scripts/ucf_rs.py reconcile
+python scripts/ucf_rs.py reconcile --partition-id AUTH-ROTATE/001
 ```
 
 It will not guess at a match — only exact recovered moves are reconciled
@@ -142,9 +168,9 @@ fails with a conflict rather than guessing at a merge.
 ### Exporting and reporting
 
 ```bash
-python scripts/ucf_rs.py export ledger   # deterministic JSONL audit ledger
-python scripts/ucf_rs.py export blocks --path src/auth.py  # virtual block export (includes content)
-python scripts/ucf_rs.py render           # generated status JSON + Markdown report
+python scripts/ucf_rs.py export ledger                      # deterministic JSONL audit ledger
+python scripts/ucf_rs.py export blocks --path src/auth.py    # virtual block export (includes content)
+python scripts/ucf_rs.py render                              # generated status JSON + Markdown report
 ```
 
 Exports are always regenerable from `.ucf-rs/` — delete and re-run `export`
