@@ -1,3 +1,4 @@
+build-docs/
 .ucf-rs/
 .tmp-test/
 __pycache__/

@@ -98,6 +98,7 @@ UCF-RS as a conformance reference but does not depend on its internals.
 
 - [User Guide](docs/user-guide.md) — for people using UCF-RS on a project
 - [Agent Guide](docs/agent-guide.md) — for AI agents driving UCF-RS
+- [Contributing](CONTRIBUTING.md)
 - [Architecture](docs/architecture.md)
 - [Commands](docs/commands.md)
 - [Storage schemas](docs/storage-schemas.md)
