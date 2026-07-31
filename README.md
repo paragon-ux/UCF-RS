@@ -27,15 +27,24 @@ The CLI uses only Python's standard library.
 - Canonical JSON record hashes, operation hashes, and server epoch chaining.
 - Managed edit deltas that transform overlay ranges and mark changed evidence.
 - Offline edit queues with epoch-checked replay for local disconnected work.
+- Recoverable source-plus-authority transactions for managed edits, offline queue writes, and offline replay.
 - Explicit `accept`, `deactivate`, `reactivate`, and `reconcile` lifecycle transitions.
 - Exact unmanaged move recovery from accepted evidence line hashes.
 - Runtime citation resolution over stdio or local HTTP, deterministic ledger export, generated status/report rendering, and virtual block export.
 - Brownfield compatibility with Reqtrace `docs/handle-registry.jsonl` and advisory `@reqtrace` discovery.
 - Strict status checks that detect stale exported ledgers.
+- Local HTTP guardrails: loopback-only binding by default, bounded request bodies, and explicit unsafe remote opt-in with no authentication or TLS.
+
+## Storage And Data Policy
+
+- [Storage schemas](docs/storage-schemas.md) define authoritative files, derived projections, canonical hash boundaries, schema failure behavior, and the UCF-Yjs conformance matrix.
+- [Data handling policy](docs/data-policy.md) defines retention, visibility, export, source/evidence disclosure, diagnostic redaction, backups, deletion, and local HTTP exposure.
 
 ## Validation
 
 ```bash
+python -c "import pathlib, py_compile; [py_compile.compile(str(path), doraise=True) for path in [*pathlib.Path('scripts').glob('*.py'), *pathlib.Path('tests').glob('*.py')]]"
 python -m unittest discover -s tests
 python scripts/ucf_rs.py --help
+python scripts/ci_status_fixture.py
 ```
