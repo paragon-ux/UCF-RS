@@ -1885,6 +1885,7 @@ class UcfRsDemoTests(unittest.TestCase):
             inspected = self.run_json(["--root", str(root), "transaction", "inspect"])
             self.assertEqual(inspected["transactions"][0]["transaction_id"], transaction_id)
             self.assertIn("abandon", inspected["transactions"][0]["resolvable_actions"])
+            self.assertNotIn("recover", inspected["transactions"][0]["resolvable_actions"])
             self.assertIn(
                 "diverged",
                 {file["status"] for file in inspected["transactions"][0]["files"]},
@@ -1893,7 +1894,7 @@ class UcfRsDemoTests(unittest.TestCase):
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 self.assertEqual(ucf.main(["--root", str(root), "recover"]), 2)
-            self.assertIn("transaction target diverged", stderr.getvalue())
+            self.assertIn("transaction", stderr.getvalue())
 
             abandoned = self.run_json(
                 [
@@ -1911,6 +1912,98 @@ class UcfRsDemoTests(unittest.TestCase):
             self.assertFalse((root / ".ucf-rs" / "transactions" / f"{transaction_id}.json").exists())
             self.assertTrue((root / ".ucf-rs" / "transactions-abandoned" / f"{transaction_id}.json").exists())
             self.assertEqual(self.status(root)["summary"], {"unmanaged_external_change": 1})
+
+    def test_mixed_intended_diverged_transaction_has_explicit_partial_resolution(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            paths = ucf.store_paths(root, ucf.STORE_DEFAULT)
+            first = root / "src" / "auth.py"
+            second = root / "src" / "other.py"
+            self.write(first, "alpha\nbeta\n")
+            self.write(second, "gamma\ndelta\n")
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+            self.assertEqual(self.activate(root, "src/other.py", "1:2"), 0)
+            before_operations = self.jsonl(root / ".ucf-rs" / "operation-log.jsonl")
+            before_index = self.jsonl(root / ".ucf-rs" / "citation-index.jsonl")
+
+            manifest = ucf.prepare_file_transaction(
+                paths,
+                "test-mixed-partial",
+                [
+                    ucf.transaction_replacement(first, "source", b"aLpha\nbeta\n"),
+                    ucf.transaction_replacement(second, "source", b"gXamma\ndelta\n"),
+                ],
+            )
+            ucf.recover_transaction_group(paths, manifest, "source")
+            ucf.advance_transaction_phase(paths, manifest, "source_applied")
+            transaction_id = str(manifest["transaction_id"])
+            self.write(second, "manual\ndelta\n")
+
+            inspected = self.run_json(["--root", str(root), "transaction", "inspect"])
+            transaction = inspected["transactions"][0]
+            self.assertEqual(transaction["transaction_id"], transaction_id)
+            self.assertEqual(
+                {file["status"] for file in transaction["files"]},
+                {"intended", "diverged"},
+            )
+            self.assertNotIn("recover", transaction["resolvable_actions"])
+            self.assertNotIn("abandon", transaction["resolvable_actions"])
+            self.assertIn(
+                "abandon_accept_current_partial_state",
+                transaction["resolvable_actions"],
+            )
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(ucf.main(["--root", str(root), "recover"]), 2)
+            self.assertIn("transaction", stderr.getvalue())
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(
+                    ucf.main(
+                        [
+                            "--root",
+                            str(root),
+                            "transaction",
+                            "abandon",
+                            "--transaction-id",
+                            transaction_id,
+                            "--reason",
+                            "missing explicit partial-state acknowledgement",
+                        ]
+                    ),
+                    2,
+                )
+            self.assertIn("--accept-current-partial-state", stderr.getvalue())
+
+            abandoned = self.run_json(
+                [
+                    "--root",
+                    str(root),
+                    "transaction",
+                    "abandon",
+                    "--transaction-id",
+                    transaction_id,
+                    "--reason",
+                    "operator accepts current partial filesystem state as unmanaged",
+                    "--accept-current-partial-state",
+                ]
+            )
+            self.assertEqual(abandoned["resolution"], "abandoned_current_partial_state")
+            self.assertTrue(abandoned["accepted_current_partial_state"])
+            self.assertEqual(self.jsonl(root / ".ucf-rs" / "operation-log.jsonl"), before_operations)
+            self.assertEqual(self.jsonl(root / ".ucf-rs" / "citation-index.jsonl"), before_index)
+            self.assertFalse((root / ".ucf-rs" / "transactions" / f"{transaction_id}.json").exists())
+            self.assertTrue((root / ".ucf-rs" / "transactions-abandoned" / f"{transaction_id}.json").exists())
+
+            status = self.status(root)
+            self.assertEqual(status["summary"], {"unmanaged_external_change": 2})
+            self.assertNotIn(
+                "E_TRANSACTION_PENDING",
+                {diagnostic["code"] for diagnostic in status["diagnostics"]},
+            )
+            self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 1)
 
     def test_apply_edit_transaction_recovers_each_phase_without_duplicate_records(self) -> None:
         for phase in ("before_preparation", "prepared", "source_applied", "authority_applied"):

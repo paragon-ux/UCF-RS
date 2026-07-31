@@ -105,10 +105,18 @@ source-recovery scanning.
 
 Malformed manifests, missing replacements, or target divergence fail closed.
 For divergence, `transaction inspect` reports file-level expected, intended, and
-current hashes. `transaction abandon` may archive a resolution only when no
-target contains the transaction's intended bytes; afterward, source status is
-computed from the current filesystem and authority records. Manual deletion of
-hot manifests is not the recovery procedure.
+current hashes plus executable resolution actions. `recover` is a resolvable
+action only when no target has diverged and every still-needed replacement
+exists. Ordinary `transaction abandon` may archive a resolution only when no
+target contains the transaction's intended bytes.
+
+Mixed intended/diverged transactions require `transaction abandon
+--accept-current-partial-state`, which archives the full inspection and explicit
+operator acknowledgment, deletes prepared replacements, and removes the hot
+manifest. It does not append operation or citation-index records and does not
+accept evidence; afterward, source status is computed from the current
+filesystem and authority records. Manual deletion of hot manifests is not the
+recovery procedure.
 
 ## UCF-Yjs Behavior Matrix
 

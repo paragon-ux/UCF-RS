@@ -65,11 +65,19 @@ replaying a non-idempotent command.
 
 If recovery fails because a target file matches neither the expected nor the
 intended transaction hash, `transaction inspect --format json` reports each
-file's current hash and status. `transaction abandon --transaction-id ID
---reason TEXT` is only allowed while no target contains intended transaction
-bytes; it archives the resolution outside the hot recovery path and leaves
-source/status to report the current filesystem state. If any intended bytes are
-present, use `recover` rather than abandon.
+file's current hash, replacement presence, status, and exact executable
+`resolvable_actions`. `recover` is advertised only when no target has diverged
+and every still-needed replacement exists. `transaction abandon --transaction-id
+ID --reason TEXT` is only advertised while no target contains intended
+transaction bytes.
+
+For mixed partial state, where at least one target contains intended bytes and
+another target has diverged, `transaction inspect` advertises
+`abandon_accept_current_partial_state`. Execute it with `transaction abandon
+--transaction-id ID --reason TEXT --accept-current-partial-state`. That archives
+the full inspection and acknowledgment outside the hot recovery path, removes
+prepared replacements, leaves source files as-is, and lets normal status report
+source/authority divergence without accepting evidence.
 
 Fault-injection environment variables are ignored unless
 `UCF_RS_ENABLE_FAULT_INJECTION=1` is also set. They are test/debug hooks only.

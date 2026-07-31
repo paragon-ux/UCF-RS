@@ -611,10 +611,18 @@ def inspect_transaction_manifest(paths: StorePaths, manifest_path: Path) -> dict
     files = [transaction_file_observation(paths, entry) for entry in manifest["files"]]
     resolvable_actions: list[str] = []
     if manifest.get("phase") != "committed":
-        if any(file["status"] == "intended" for file in files):
+        has_diverged = any(file["status"] == "diverged" for file in files)
+        has_intended = any(file["status"] == "intended" for file in files)
+        has_missing_required_replacement = any(
+            file["status"] != "intended" and not file["replacement_exists"]
+            for file in files
+        )
+        if not has_diverged and not has_missing_required_replacement:
             resolvable_actions.append("recover")
-        else:
-            resolvable_actions.extend(["recover", "abandon"])
+        if not has_intended:
+            resolvable_actions.append("abandon")
+        elif has_diverged:
+            resolvable_actions.append("abandon_accept_current_partial_state")
     return {
         "transaction_id": manifest["transaction_id"],
         "purpose": manifest["purpose"],
@@ -637,7 +645,12 @@ def inspect_transactions(paths: StorePaths, transaction_id: str | None = None) -
     return [inspect_transaction_manifest(paths, path) for path in manifest_paths]
 
 
-def abandon_transaction(paths: StorePaths, transaction_id: str, reason: str) -> dict[str, Any]:
+def abandon_transaction(
+    paths: StorePaths,
+    transaction_id: str,
+    reason: str,
+    accept_current_partial_state: bool = False,
+) -> dict[str, Any]:
     manifest_path = transaction_manifest_path(paths, transaction_id)
     if not manifest_path.exists():
         raise DemoError(f"transaction not found: {transaction_id}")
@@ -647,9 +660,11 @@ def abandon_transaction(paths: StorePaths, transaction_id: str, reason: str) -> 
         complete_committed_manifest(paths, manifest, manifest_path)
         raise DemoError("transaction is already committed; committed manifest was archived")
     intended = [file["path"] for file in inspection["files"] if file["status"] == "intended"]
-    if intended:
+    diverged = [file["path"] for file in inspection["files"] if file["status"] == "diverged"]
+    if intended and not (accept_current_partial_state and diverged):
         raise DemoError(
-            "cannot abandon transaction after intended bytes are present; run recover instead: "
+            "cannot abandon transaction after intended bytes are present without "
+            "--accept-current-partial-state: "
             + ", ".join(intended)
         )
     manifest = read_transaction_manifest(manifest_path)
@@ -657,9 +672,10 @@ def abandon_transaction(paths: StorePaths, transaction_id: str, reason: str) -> 
     resolution = {
         "schema_version": TRANSACTION_RESOLUTION_SCHEMA,
         "transaction_id": transaction_id,
-        "resolution": "abandoned",
+        "resolution": "abandoned_current_partial_state" if accept_current_partial_state else "abandoned",
         "reason": reason,
         "resolved_at": utc_now(),
+        "accepted_current_partial_state": accept_current_partial_state,
         "inspection": inspection,
     }
     archive = transaction_abandoned_archive(paths)
@@ -2488,7 +2504,12 @@ def command_transaction_abandon(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     paths = store_paths(root, args.store)
     with authority_write_lock(paths):
-        output = abandon_transaction(paths, args.transaction_id, args.reason)
+        output = abandon_transaction(
+            paths,
+            args.transaction_id,
+            args.reason,
+            args.accept_current_partial_state,
+        )
     if args.format == "json":
         print(json.dumps(output, indent=2, sort_keys=True))
     else:
@@ -3544,6 +3565,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     transaction_abandon.add_argument("--transaction-id", required=True)
     transaction_abandon.add_argument("--reason", required=True)
+    transaction_abandon.add_argument(
+        "--accept-current-partial-state",
+        action="store_true",
+        help="explicitly abandon a mixed intended/diverged transaction and leave current files as unmanaged state",
+    )
     transaction_abandon.add_argument("--format", choices=("text", "json"), default="text")
     transaction_abandon.set_defaults(func=command_transaction_abandon)
 
