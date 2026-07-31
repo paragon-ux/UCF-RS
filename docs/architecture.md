@@ -24,6 +24,17 @@ offline, replay fails with a conflict instead of guessing a merge. The queue is
 local replay material, not accepted evidence; successful replay appends normal
 operation and citation-index records.
 
+Managed source-plus-authority writes use recoverable file transactions under
+`.ucf-rs/transactions/`. A transaction records prepared, source-applied,
+authority-applied, and committed phases plus expected and intended file hashes.
+Recovery is idempotent and completes prepared replacements with `os.replace`.
+This is recoverable consistency, not a claim of cross-file atomicity.
+
 Generated exports remain non-authoritative. `status --strict` reports stale
 exported ledgers when `docs/ucf-trace-ledger.jsonl` no longer matches current
 authority plus filesystem projection.
+
+Storage schemas and data classification are documented in
+[`storage-schemas.md`](storage-schemas.md) and [`data-policy.md`](data-policy.md).
+Those documents are descriptive contracts for the current runtime and do not
+change canonical hash semantics.

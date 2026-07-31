@@ -14,10 +14,12 @@ import contextlib
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
+import ipaddress
 import json
 import os
 import re
 import sys
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +37,7 @@ STORE_DEFAULT = ".ucf-rs"
 EXPORT_LEDGER_DEFAULT = "docs/ucf-trace-ledger.jsonl"
 EXPORT_STATUS_DEFAULT = "docs/ucf-trace-status.json"
 EXPORT_REPORT_DEFAULT = "docs/ucf-trace-report.md"
+HTTP_REQUEST_MAX_BYTES = 1024 * 1024
 
 PROJECT_SCHEMA = "ucf-rs.project.v1"
 INDEX_SCHEMA = "ucf-rs.index.v1"
@@ -46,6 +49,7 @@ PREFLIGHT_SCHEMA = "ucf-rs.preflight.v1"
 STATUS_SCHEMA = "ucf-rs.status.v1"
 RESOLVE_SCHEMA = "ucf-rs.resolve.v1"
 EXPORT_SCHEMA = "ucf-rs.export.v1"
+TRANSACTION_SCHEMA = "ucf-rs.transaction.v1"
 
 HANDLE_PATTERN = r"[A-Z][A-Z0-9_.-]*"
 HANDLE_RE = re.compile(rf"^{HANDLE_PATTERN}$")
@@ -69,6 +73,7 @@ class StorePaths:
     documents: Path
     handles: Path
     snapshots: Path
+    transactions: Path
 
 
 @dataclass(frozen=True)
@@ -203,6 +208,7 @@ def store_paths(root: Path, configured_store: str) -> StorePaths:
         documents=store / "document-index.jsonl",
         handles=store / "handle-cache.jsonl",
         snapshots=store / "snapshots",
+        transactions=store / "transactions",
     )
 
 
@@ -237,6 +243,7 @@ def authority_mutation(command: Any) -> Any:
         root = Path(args.root).resolve()
         paths = store_paths(root, args.store)
         with authority_write_lock(paths):
+            recover_pending_transactions(paths)
             return command(args)
 
     wrapped.__name__ = command.__name__
@@ -257,6 +264,297 @@ def read_text_document(path: Path) -> str:
 def write_text_document(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(normalize_text(content), encoding="utf-8", newline="\n")
+
+
+def read_file_bytes(path: Path) -> bytes:
+    if not path.exists():
+        return b""
+    return path.read_bytes()
+
+
+def json_line_bytes(record: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def append_jsonl_bytes(path: Path, records: Iterable[dict[str, Any]]) -> bytes:
+    content = bytearray(read_file_bytes(path))
+    for record in records:
+        content.extend(json_line_bytes(record))
+    return bytes(content)
+
+
+def transaction_replacement(path: Path, role: str, content: bytes) -> dict[str, Any]:
+    return {
+        "path": path,
+        "role": role,
+        "content": content,
+        "expected_hash": transaction_file_hash(read_file_bytes(path)),
+    }
+
+
+def transaction_file_hash(content: bytes) -> str:
+    return framed_hash("ucf.transaction_file.v1", content)
+
+
+def fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def write_bytes_durable(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    fsync_directory(path.parent)
+
+
+def write_json_durable(path: Path, content: dict[str, Any]) -> None:
+    body = json.dumps(content, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    write_bytes_durable(temporary, body)
+    os.replace(temporary, path)
+    fsync_directory(path.parent)
+
+
+def replace_prepared_file(replacement: Path, target: Path) -> None:
+    os.replace(replacement, target)
+    fsync_directory(target.parent)
+
+
+def is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def parse_http_content_length(value: str) -> int:
+    if not re.fullmatch(r"[0-9]+", value):
+        raise DemoError("invalid Content-Length")
+    return int(value)
+
+
+def transaction_manifest_path(paths: StorePaths, transaction_id: str) -> Path:
+    return paths.transactions / f"{transaction_id}.json"
+
+
+def transaction_relative(paths: StorePaths, path: Path) -> str:
+    return relative_path(paths.root, path)
+
+
+def transaction_abs_path(paths: StorePaths, relative: str) -> Path:
+    return project_path(paths.root, relative)
+
+
+def write_transaction_manifest(paths: StorePaths, manifest: dict[str, Any]) -> None:
+    paths.transactions.mkdir(parents=True, exist_ok=True)
+    write_json_durable(transaction_manifest_path(paths, str(manifest["transaction_id"])), manifest)
+
+
+def advance_transaction_phase(paths: StorePaths, manifest: dict[str, Any], phase: str) -> None:
+    manifest["phase"] = phase
+    manifest.setdefault("phase_history", []).append({"phase": phase, "at": utc_now()})
+    write_transaction_manifest(paths, manifest)
+    maybe_fail_after_transaction_phase(phase)
+
+
+def maybe_fail_after_transaction_phase(phase: str) -> None:
+    if os.environ.get("UCF_RS_CRASH_AFTER_PHASE") == phase:
+        os._exit(97)
+    if os.environ.get("UCF_RS_FAIL_AFTER_PHASE") == phase:
+        raise DemoError(f"fault injection after transaction phase {phase}")
+
+
+def prepare_file_transaction(
+    paths: StorePaths,
+    purpose: str,
+    replacements: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if os.environ.get("UCF_RS_FAIL_AFTER_PHASE") == "before_preparation":
+        raise DemoError("fault injection before transaction preparation")
+    if os.environ.get("UCF_RS_CRASH_AFTER_PHASE") == "before_preparation":
+        os._exit(97)
+
+    transaction_id = uuid.uuid4().hex
+    files: list[dict[str, Any]] = []
+    for index, replacement in enumerate(replacements):
+        target = Path(replacement["path"])
+        content = replacement["content"]
+        if not isinstance(content, bytes):
+            raise DemoError("transaction replacement content must be bytes")
+        current = read_file_bytes(target)
+        expected_hash = transaction_file_hash(current)
+        intended_hash = transaction_file_hash(content)
+        expected = replacement.get("expected_hash")
+        if expected is not None and expected != expected_hash:
+            raise DemoError(f"transaction expected hash mismatch for {target.as_posix()}")
+        replacement_path = target.with_name(f"{target.name}.{transaction_id}.{index}.replacement")
+        write_bytes_durable(replacement_path, content)
+        files.append(
+            {
+                "role": replacement["role"],
+                "path": transaction_relative(paths, target),
+                "replacement_path": transaction_relative(paths, replacement_path),
+                "expected_hash": expected_hash,
+                "intended_hash": intended_hash,
+            }
+        )
+
+    manifest: dict[str, Any] = {
+        "schema_version": TRANSACTION_SCHEMA,
+        "transaction_id": transaction_id,
+        "purpose": purpose,
+        "phase": "prepared",
+        "created_at": utc_now(),
+        "phase_history": [{"phase": "prepared", "at": utc_now()}],
+        "files": files,
+    }
+    write_transaction_manifest(paths, manifest)
+    maybe_fail_after_transaction_phase("prepared")
+    return manifest
+
+
+def validate_transaction_manifest(manifest: dict[str, Any]) -> None:
+    if manifest.get("schema_version") != TRANSACTION_SCHEMA:
+        raise DemoError("transaction manifest has unsupported schema")
+    if manifest.get("phase") not in {"prepared", "source_applied", "authority_applied", "committed"}:
+        raise DemoError("transaction manifest has invalid phase")
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise DemoError("transaction manifest has no files")
+    for file_entry in files:
+        if not isinstance(file_entry, dict):
+            raise DemoError("transaction file entry must be an object")
+        if file_entry.get("role") not in {"source", "authority"}:
+            raise DemoError("transaction file entry has invalid role")
+        for field in ("path", "replacement_path", "expected_hash", "intended_hash"):
+            if not isinstance(file_entry.get(field), str):
+                raise DemoError(f"transaction file entry missing {field}")
+
+
+def read_transaction_manifest(path: Path) -> dict[str, Any]:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise DemoError(f"malformed transaction manifest {path.as_posix()}: {error}") from error
+    if not isinstance(manifest, dict):
+        raise DemoError(f"malformed transaction manifest {path.as_posix()}: root must be an object")
+    validate_transaction_manifest(manifest)
+    return manifest
+
+
+def recover_transaction_group(paths: StorePaths, manifest: dict[str, Any], role: str) -> None:
+    for file_entry in manifest["files"]:
+        if file_entry["role"] != role:
+            continue
+        target = transaction_abs_path(paths, file_entry["path"])
+        replacement = transaction_abs_path(paths, file_entry["replacement_path"])
+        current_hash = transaction_file_hash(read_file_bytes(target))
+        intended_hash = str(file_entry["intended_hash"])
+        expected_hash = str(file_entry["expected_hash"])
+        if current_hash == intended_hash:
+            continue
+        if current_hash != expected_hash:
+            raise DemoError(
+                "transaction target diverged before recovery: "
+                + file_entry["path"]
+            )
+        if not replacement.exists():
+            raise DemoError("transaction replacement is missing: " + file_entry["replacement_path"])
+        replace_prepared_file(replacement, target)
+
+
+def recover_one_transaction(paths: StorePaths, manifest_path: Path) -> dict[str, Any]:
+    manifest = read_transaction_manifest(manifest_path)
+    phase = str(manifest["phase"])
+    if phase == "committed":
+        return {"transaction_id": manifest["transaction_id"], "phase": phase, "status": "already_committed"}
+    if phase == "prepared":
+        recover_transaction_group(paths, manifest, "source")
+        advance_transaction_phase(paths, manifest, "source_applied")
+        phase = "source_applied"
+    if phase == "source_applied":
+        recover_transaction_group(paths, manifest, "authority")
+        advance_transaction_phase(paths, manifest, "authority_applied")
+        phase = "authority_applied"
+    if phase == "authority_applied":
+        for file_entry in manifest["files"]:
+            target = transaction_abs_path(paths, file_entry["path"])
+            if transaction_file_hash(read_file_bytes(target)) != file_entry["intended_hash"]:
+                raise DemoError("transaction intended hash not present: " + file_entry["path"])
+        advance_transaction_phase(paths, manifest, "committed")
+        return {"transaction_id": manifest["transaction_id"], "phase": "committed", "status": "recovered"}
+    raise DemoError("transaction manifest has invalid recovery phase")
+
+
+def recover_pending_transactions(paths: StorePaths) -> dict[str, Any]:
+    if not paths.transactions.exists():
+        return {"schema_version": "ucf-rs.recovery.v1", "recovered": [], "pending": 0}
+    recovered: list[dict[str, Any]] = []
+    pending_paths = sorted(paths.transactions.glob("*.json"))
+    for manifest_path in pending_paths:
+        manifest = read_transaction_manifest(manifest_path)
+        if manifest.get("phase") == "committed":
+            continue
+        recovered.append(recover_one_transaction(paths, manifest_path))
+    return {"schema_version": "ucf-rs.recovery.v1", "recovered": recovered, "pending": 0}
+
+
+def pending_transaction_diagnostics(paths: StorePaths) -> list[dict[str, Any]]:
+    if not paths.transactions.exists():
+        return []
+    diagnostics: list[dict[str, Any]] = []
+    for manifest_path in sorted(paths.transactions.glob("*.json")):
+        try:
+            manifest = read_transaction_manifest(manifest_path)
+        except DemoError as error:
+            diagnostics.append(
+                {
+                    "code": "E_TRANSACTION_MALFORMED",
+                    "severity": "fatal",
+                    "message": str(error),
+                    "path": relative_path(paths.root, manifest_path),
+                }
+            )
+            continue
+        if manifest.get("phase") != "committed":
+            diagnostics.append(
+                {
+                    "code": "E_TRANSACTION_PENDING",
+                    "severity": "fatal",
+                    "message": "pending recoverable transaction requires recovery",
+                    "path": relative_path(paths.root, manifest_path),
+                }
+            )
+    return diagnostics
+
+
+def run_file_transaction(
+    paths: StorePaths,
+    purpose: str,
+    replacements: list[dict[str, Any]],
+) -> dict[str, Any]:
+    manifest = prepare_file_transaction(paths, purpose, replacements)
+    recover_transaction_group(paths, manifest, "source")
+    advance_transaction_phase(paths, manifest, "source_applied")
+    recover_transaction_group(paths, manifest, "authority")
+    advance_transaction_phase(paths, manifest, "authority_applied")
+    recover_one_transaction(paths, transaction_manifest_path(paths, str(manifest["transaction_id"])))
+    return manifest
 
 
 def line_offsets(text: str) -> list[int]:
@@ -648,7 +946,7 @@ def range_payload(selected_range: Range) -> dict[str, int | str]:
     }
 
 
-def append_operation(
+def build_operation_record(
     paths: StorePaths,
     operations: list[dict[str, Any]],
     operation_type: str,
@@ -676,9 +974,56 @@ def append_operation(
         "tool": {"name": TOOL_NAME, "version": TOOL_VERSION},
     }
     record["operation_hash"] = operation_hash(record)
+    return record
+
+
+def append_operation(
+    paths: StorePaths,
+    operations: list[dict[str, Any]],
+    operation_type: str,
+    document_record_id: str,
+    base_server_epoch_hash: str,
+    document_before_hash: str,
+    document_after_hash: str,
+    edits: list[dict[str, Any]],
+    affected_partitions: list[str],
+) -> dict[str, Any]:
+    record = build_operation_record(
+        paths,
+        operations,
+        operation_type,
+        document_record_id,
+        base_server_epoch_hash,
+        document_before_hash,
+        document_after_hash,
+        edits,
+        affected_partitions,
+    )
     append_jsonl(paths.operations, record)
     operations.append(record)
     return record
+
+
+def build_document_record(
+    paths: StorePaths,
+    relative_uri: str,
+    document_record_id: str,
+    revision_hash: str,
+    server_epoch_value_hash: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": DOCUMENT_SCHEMA,
+        "record_type": "document_revision",
+        "document_id": document_record_id,
+        "project_id": project_id(paths.root),
+        "adapter": {"kind": "filesystem-text", "uri": relative_uri},
+        "current_document_revision_hash": revision_hash,
+        "last_server_epoch_hash": server_epoch_value_hash,
+        "line_ending_policy": "lf-normalized",
+        "encoding": "utf-8",
+        "updated_at": utc_now(),
+        "tool": {"name": TOOL_NAME, "version": TOOL_VERSION},
+    }
 
 
 def append_document_record(
@@ -690,20 +1035,44 @@ def append_document_record(
 ) -> None:
     append_jsonl(
         paths.documents,
-        {
-            "schema_version": DOCUMENT_SCHEMA,
-            "record_type": "document_revision",
-            "document_id": document_record_id,
-            "project_id": project_id(paths.root),
-            "adapter": {"kind": "filesystem-text", "uri": relative_uri},
-            "current_document_revision_hash": revision_hash,
-            "last_server_epoch_hash": server_epoch_value_hash,
-            "line_ending_policy": "lf-normalized",
-            "encoding": "utf-8",
-            "updated_at": utc_now(),
-            "tool": {"name": TOOL_NAME, "version": TOOL_VERSION},
-        },
+        build_document_record(paths, relative_uri, document_record_id, revision_hash, server_epoch_value_hash),
     )
+
+
+def run_authority_record_transaction(
+    paths: StorePaths,
+    purpose: str,
+    operation_records: list[dict[str, Any]] | None = None,
+    index_records: list[dict[str, Any]] | None = None,
+    document_records: list[dict[str, Any]] | None = None,
+) -> None:
+    replacements: list[dict[str, Any]] = []
+    if operation_records:
+        replacements.append(
+            transaction_replacement(
+                paths.operations,
+                "authority",
+                append_jsonl_bytes(paths.operations, operation_records),
+            )
+        )
+    if index_records:
+        replacements.append(
+            transaction_replacement(
+                paths.index,
+                "authority",
+                append_jsonl_bytes(paths.index, index_records),
+            )
+        )
+    if document_records:
+        replacements.append(
+            transaction_replacement(
+                paths.documents,
+                "authority",
+                append_jsonl_bytes(paths.documents, document_records),
+            )
+        )
+    if replacements:
+        run_file_transaction(paths, purpose, replacements)
 
 
 def project_record(root: Path) -> dict[str, Any]:
@@ -721,7 +1090,7 @@ def project_record(root: Path) -> dict[str, Any]:
     }
 
 
-def append_index_record(
+def build_index_record(
     paths: StorePaths,
     index_records: list[dict[str, Any]],
     operation_record: dict[str, Any],
@@ -793,6 +1162,51 @@ def append_index_record(
         "tool": {"name": TOOL_NAME, "version": TOOL_VERSION},
     }
     record["index_record_hash"] = index_record_hash(record)
+    return record
+
+
+def append_index_record(
+    paths: StorePaths,
+    index_records: list[dict[str, Any]],
+    operation_record: dict[str, Any],
+    server_epoch: int,
+    server_epoch_value_hash: str,
+    transition: str,
+    state: str,
+    relative_uri: str,
+    partition_id: str,
+    upstream_handle: str,
+    accepted_hash: str,
+    current_hash: str,
+    document_revision_hash: str,
+    selected_range: Range,
+    current_content: str,
+    transform_status: str,
+    accepted_line_hashes: list[str] | None = None,
+    accepted_line_count: int | None = None,
+    accepted_byte_count: int | None = None,
+) -> dict[str, Any]:
+    record = build_index_record(
+        paths,
+        index_records,
+        operation_record,
+        server_epoch,
+        server_epoch_value_hash,
+        transition,
+        state,
+        relative_uri,
+        partition_id,
+        upstream_handle,
+        accepted_hash,
+        current_hash,
+        document_revision_hash,
+        selected_range,
+        current_content,
+        transform_status,
+        accepted_line_hashes,
+        accepted_line_count,
+        accepted_byte_count,
+    )
     append_jsonl(paths.index, record)
     index_records.append(record)
     return record
@@ -804,6 +1218,7 @@ def command_init(args: argparse.Namespace) -> int:
     paths = store_paths(root, args.store)
     paths.store.mkdir(parents=True, exist_ok=True)
     paths.snapshots.mkdir(parents=True, exist_ok=True)
+    paths.transactions.mkdir(parents=True, exist_ok=True)
     if not paths.project.exists():
         paths.project.write_text(
             json.dumps(project_record(root), indent=2, sort_keys=True) + "\n",
@@ -888,7 +1303,7 @@ def command_activate(args: argparse.Namespace) -> int:
     doc_hash = str(plan["document_revision_hash"])
     document_record_id = str(plan["document_id"])
     partition_id = str(plan["partition_id"])
-    operation_record = append_operation(
+    operation_record = build_operation_record(
         paths,
         operations,
         "activate",
@@ -900,7 +1315,7 @@ def command_activate(args: argparse.Namespace) -> int:
         [partition_id],
     )
     new_epoch_hash = epoch_hash(current_epoch_hash, operation_record["operation_hash"])
-    index_record = append_index_record(
+    index_record = build_index_record(
         paths,
         index_records,
         operation_record,
@@ -918,7 +1333,14 @@ def command_activate(args: argparse.Namespace) -> int:
         selected_text,
         "valid",
     )
-    append_document_record(paths, relative_uri, document_record_id, doc_hash, new_epoch_hash)
+    document_record = build_document_record(paths, relative_uri, document_record_id, doc_hash, new_epoch_hash)
+    run_authority_record_transaction(
+        paths,
+        "activate",
+        [operation_record],
+        [index_record],
+        [document_record],
+    )
     output = {
         "partition_id": partition_id,
         "citation": index_record["citation"],
@@ -1042,10 +1464,9 @@ def command_apply_edit(args: argparse.Namespace) -> int:
         )
         if result.status != "unaffected":
             transformed.append((record, result))
-    write_text_document(source_path, new_text)
     current_epoch, current_epoch_hash = last_epoch(index_records)
     affected = [str(record["partition_id"]) for record, _ in transformed]
-    operation_record = append_operation(
+    operation_record = build_operation_record(
         paths,
         operations,
         "edit",
@@ -1056,6 +1477,7 @@ def command_apply_edit(args: argparse.Namespace) -> int:
         [edit_record(edit_start, edit_end, inserted_text, args.boundary_policy)],
         affected,
     )
+    future_index_records = list(index_records)
     server_epoch = current_epoch
     server_epoch_value_hash = current_epoch_hash
     if transformed:
@@ -1068,30 +1490,40 @@ def command_apply_edit(args: argparse.Namespace) -> int:
         current_hash = content_hash_text(current_text)
         evidence = record.get("evidence", {})
         accepted_line_hashes = evidence.get("line_hashes") if isinstance(evidence, dict) else None
-        emitted.append(
-            append_index_record(
-                paths,
-                index_records,
-                operation_record,
-                server_epoch,
-                server_epoch_value_hash,
-                "edit-transform",
-                "active",
-                relative_uri,
-                str(record["partition_id"]),
-                str(record["upstream_handle"]),
-                str(record["accepted_content_hash"]),
-                current_hash,
-                after_hash,
-                selected_range,
-                current_text,
-                result.status,
-                accepted_line_hashes if isinstance(accepted_line_hashes, list) else None,
-                evidence.get("line_count") if isinstance(evidence, dict) else None,
-                evidence.get("byte_count") if isinstance(evidence, dict) else None,
-            )
+        index_record = build_index_record(
+            paths,
+            future_index_records,
+            operation_record,
+            server_epoch,
+            server_epoch_value_hash,
+            "edit-transform",
+            "active",
+            relative_uri,
+            str(record["partition_id"]),
+            str(record["upstream_handle"]),
+            str(record["accepted_content_hash"]),
+            current_hash,
+            after_hash,
+            selected_range,
+            current_text,
+            result.status,
+            accepted_line_hashes if isinstance(accepted_line_hashes, list) else None,
+            evidence.get("line_count") if isinstance(evidence, dict) else None,
+            evidence.get("byte_count") if isinstance(evidence, dict) else None,
         )
-    append_document_record(paths, relative_uri, document_record_id, after_hash, server_epoch_value_hash)
+        future_index_records.append(index_record)
+        emitted.append(index_record)
+    document_record = build_document_record(paths, relative_uri, document_record_id, after_hash, server_epoch_value_hash)
+    replacements = [
+        transaction_replacement(source_path, "source", normalize_text(new_text).encode("utf-8")),
+        transaction_replacement(paths.operations, "authority", append_jsonl_bytes(paths.operations, [operation_record])),
+        transaction_replacement(paths.documents, "authority", append_jsonl_bytes(paths.documents, [document_record])),
+    ]
+    if emitted:
+        replacements.append(
+            transaction_replacement(paths.index, "authority", append_jsonl_bytes(paths.index, emitted))
+        )
+    run_file_transaction(paths, "apply-edit", replacements)
     output = {
         "operation_hash": operation_record["operation_hash"],
         "affected_partitions": affected,
@@ -1113,7 +1545,7 @@ def command_apply_edit(args: argparse.Namespace) -> int:
     return 0
 
 
-def append_offline_operation(
+def build_offline_operation_record(
     paths: StorePaths,
     queued: list[dict[str, Any]],
     relative_uri: str,
@@ -1146,6 +1578,35 @@ def append_offline_operation(
         "tool": {"name": TOOL_NAME, "version": TOOL_VERSION},
     }
     record["offline_operation_hash"] = offline_operation_hash(record)
+    return record
+
+
+def append_offline_operation(
+    paths: StorePaths,
+    queued: list[dict[str, Any]],
+    relative_uri: str,
+    document_record_id: str,
+    base_server_epoch_hash: str,
+    base_operation_hash: str | None,
+    before_hash: str,
+    after_hash: str,
+    edit: dict[str, Any],
+    affected: list[str],
+    document_after_text: str,
+) -> dict[str, Any]:
+    record = build_offline_operation_record(
+        paths,
+        queued,
+        relative_uri,
+        document_record_id,
+        base_server_epoch_hash,
+        base_operation_hash,
+        before_hash,
+        after_hash,
+        edit,
+        affected,
+        document_after_text,
+    )
     append_jsonl(paths.offline_queue, record)
     queued.append(record)
     return record
@@ -1203,8 +1664,7 @@ def command_queue_offline_edit(args: argparse.Namespace) -> int:
             affected.append(str(record["partition_id"]))
     _, base_epoch_hash = last_epoch(index_records)
     base_operation_hash = operations[-1]["operation_hash"] if operations else None
-    write_text_document(source_path, new_text)
-    record = append_offline_operation(
+    record = build_offline_operation_record(
         paths,
         queued,
         relative_uri,
@@ -1217,6 +1677,18 @@ def command_queue_offline_edit(args: argparse.Namespace) -> int:
         | {"inserted_text": inserted_text},
         affected,
         new_text,
+    )
+    run_file_transaction(
+        paths,
+        "queue-offline-edit",
+        [
+            transaction_replacement(source_path, "source", normalize_text(new_text).encode("utf-8")),
+            transaction_replacement(
+                paths.offline_queue,
+                "authority",
+                append_jsonl_bytes(paths.offline_queue, [record]),
+            ),
+        ],
     )
     output = {
         "offline_operation_hash": record["offline_operation_hash"],
@@ -1339,112 +1811,6 @@ def validate_offline_replay_base(
             )
 
 
-def replay_offline_record(
-    paths: StorePaths,
-    operations: list[dict[str, Any]],
-    index_records: list[dict[str, Any]],
-    record: dict[str, Any],
-) -> list[str]:
-    adapter = record.get("adapter", {})
-    relative_uri = adapter.get("uri") if isinstance(adapter, dict) else None
-    if not isinstance(relative_uri, str):
-        raise DemoError("offline operation is missing a filesystem URI")
-    edits = record.get("edits")
-    if not isinstance(edits, list) or len(edits) != 1 or not isinstance(edits[0], dict):
-        raise DemoError("offline replay currently requires exactly one edit per queued operation")
-    edit = edits[0]
-    inserted_text = edit.get("inserted_text")
-    if not isinstance(inserted_text, str):
-        raise DemoError("offline operation lacks replay text")
-    boundary_policy = edit.get("boundary_policy", "outside")
-    if boundary_policy not in {"inside", "outside"}:
-        raise DemoError(f"unsupported offline boundary policy: {boundary_policy}")
-    document_after_text = record.get("document_after_text")
-    if not isinstance(document_after_text, str):
-        raise DemoError("offline operation lacks replay document text")
-    after_hash = document_hash_text(document_after_text)
-    if after_hash != record.get("document_after_hash"):
-        raise DemoError("offline operation document text does not match its recorded after hash")
-    source_path = project_path(paths.root, relative_uri)
-    write_text_document(source_path, document_after_text)
-    current_epoch, current_epoch_hash = last_epoch(index_records)
-    operation_record = append_operation(
-        paths,
-        operations,
-        "edit",
-        str(record["document_id"]),
-        current_epoch_hash,
-        str(record["document_before_hash"]),
-        str(record["document_after_hash"]),
-        [
-            edit_record(
-                int(edit["start"]),
-                int(edit["end"]),
-                inserted_text,
-                str(boundary_policy),
-            )
-        ],
-        [str(item) for item in record.get("affected_partitions", [])],
-    )
-    server_epoch = current_epoch
-    server_epoch_value_hash = current_epoch_hash
-    active_records = document_active_records(paths.root, index_records, relative_uri)
-    transformed: list[tuple[dict[str, Any], TransformResult]] = []
-    for active in active_records:
-        record_range = active.get("range", {})
-        if not isinstance(record_range, dict):
-            continue
-        result = transform_range(
-            int(record_range["start"]),
-            int(record_range["end"]),
-            int(edit["start"]),
-            int(edit["end"]),
-            len(normalize_text(inserted_text)),
-            str(boundary_policy),
-        )
-        if result.status != "unaffected":
-            transformed.append((active, result))
-    if transformed:
-        server_epoch += 1
-        server_epoch_value_hash = epoch_hash(current_epoch_hash, operation_record["operation_hash"])
-    emitted: list[str] = []
-    for active, result in transformed:
-        selected_range = range_from_offsets(document_after_text, result.start, result.end)
-        current_text = document_after_text[selected_range.start : selected_range.end]
-        evidence = active.get("evidence", {})
-        accepted_line_hashes = evidence.get("line_hashes") if isinstance(evidence, dict) else None
-        appended = append_index_record(
-            paths,
-            index_records,
-            operation_record,
-            server_epoch,
-            server_epoch_value_hash,
-            "edit-transform",
-            "active",
-            relative_uri,
-            str(active["partition_id"]),
-            str(active["upstream_handle"]),
-            str(active["accepted_content_hash"]),
-            content_hash_text(current_text),
-            str(record["document_after_hash"]),
-            selected_range,
-            current_text,
-            result.status,
-            accepted_line_hashes if isinstance(accepted_line_hashes, list) else None,
-            evidence.get("line_count") if isinstance(evidence, dict) else None,
-            evidence.get("byte_count") if isinstance(evidence, dict) else None,
-        )
-        emitted.append(str(appended["partition_id"]))
-    append_document_record(
-        paths,
-        relative_uri,
-        str(record["document_id"]),
-        str(record["document_after_hash"]),
-        server_epoch_value_hash,
-    )
-    return emitted
-
-
 @authority_mutation
 def command_replay_offline(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
@@ -1458,12 +1824,138 @@ def command_replay_offline(args: argparse.Namespace) -> int:
     for record in queued:
         validate_offline_replay_base(operations, index_records, record, initial_epoch_hash)
     replayed: list[str] = []
+    operation_records: list[dict[str, Any]] = []
+    index_records_to_append: list[dict[str, Any]] = []
+    document_records: list[dict[str, Any]] = []
+    source_replacements: dict[Path, bytes] = {}
+    future_operations = list(operations)
+    future_index_records = list(index_records)
     for record in queued:
-        replayed.extend(replay_offline_record(paths, operations, index_records, record))
+        adapter = record.get("adapter", {})
+        relative_uri = adapter.get("uri") if isinstance(adapter, dict) else None
+        if not isinstance(relative_uri, str):
+            raise DemoError("offline operation is missing a filesystem URI")
+        edits = record.get("edits")
+        if not isinstance(edits, list) or len(edits) != 1 or not isinstance(edits[0], dict):
+            raise DemoError("offline replay currently requires exactly one edit per queued operation")
+        edit = edits[0]
+        inserted_text = edit.get("inserted_text")
+        if not isinstance(inserted_text, str):
+            raise DemoError("offline operation lacks replay text")
+        boundary_policy = edit.get("boundary_policy", "outside")
+        if boundary_policy not in {"inside", "outside"}:
+            raise DemoError(f"unsupported offline boundary policy: {boundary_policy}")
+        document_after_text = record.get("document_after_text")
+        if not isinstance(document_after_text, str):
+            raise DemoError("offline operation lacks replay document text")
+        after_hash = document_hash_text(document_after_text)
+        if after_hash != record.get("document_after_hash"):
+            raise DemoError("offline operation document text does not match its recorded after hash")
+
+        source_path = project_path(paths.root, relative_uri)
+        source_replacements[source_path] = normalize_text(document_after_text).encode("utf-8")
+        current_epoch, current_epoch_hash = last_epoch(future_index_records)
+        operation_record = build_operation_record(
+            paths,
+            future_operations,
+            "edit",
+            str(record["document_id"]),
+            current_epoch_hash,
+            str(record["document_before_hash"]),
+            str(record["document_after_hash"]),
+            [
+                edit_record(
+                    int(edit["start"]),
+                    int(edit["end"]),
+                    inserted_text,
+                    str(boundary_policy),
+                )
+            ],
+            [str(item) for item in record.get("affected_partitions", [])],
+        )
+        future_operations.append(operation_record)
+        operation_records.append(operation_record)
+        server_epoch = current_epoch
+        server_epoch_value_hash = current_epoch_hash
+        active_records = document_active_records(paths.root, future_index_records, relative_uri)
+        transformed: list[tuple[dict[str, Any], TransformResult]] = []
+        for active in active_records:
+            record_range = active.get("range", {})
+            if not isinstance(record_range, dict):
+                continue
+            result = transform_range(
+                int(record_range["start"]),
+                int(record_range["end"]),
+                int(edit["start"]),
+                int(edit["end"]),
+                len(normalize_text(inserted_text)),
+                str(boundary_policy),
+            )
+            if result.status != "unaffected":
+                transformed.append((active, result))
+        if transformed:
+            server_epoch += 1
+            server_epoch_value_hash = epoch_hash(current_epoch_hash, operation_record["operation_hash"])
+        for active, result in transformed:
+            selected_range = range_from_offsets(document_after_text, result.start, result.end)
+            current_text = document_after_text[selected_range.start : selected_range.end]
+            evidence = active.get("evidence", {})
+            accepted_line_hashes = evidence.get("line_hashes") if isinstance(evidence, dict) else None
+            appended = build_index_record(
+                paths,
+                future_index_records,
+                operation_record,
+                server_epoch,
+                server_epoch_value_hash,
+                "edit-transform",
+                "active",
+                relative_uri,
+                str(active["partition_id"]),
+                str(active["upstream_handle"]),
+                str(active["accepted_content_hash"]),
+                content_hash_text(current_text),
+                str(record["document_after_hash"]),
+                selected_range,
+                current_text,
+                result.status,
+                accepted_line_hashes if isinstance(accepted_line_hashes, list) else None,
+                evidence.get("line_count") if isinstance(evidence, dict) else None,
+                evidence.get("byte_count") if isinstance(evidence, dict) else None,
+            )
+            future_index_records.append(appended)
+            index_records_to_append.append(appended)
+            replayed.append(str(appended["partition_id"]))
+        document_records.append(
+            build_document_record(
+                paths,
+                relative_uri,
+                str(record["document_id"]),
+                str(record["document_after_hash"]),
+                server_epoch_value_hash,
+            )
+        )
     if queued:
-        with paths.offline_replayed.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(paths.offline_queue.read_text(encoding="utf-8"))
-        paths.offline_queue.write_text("", encoding="utf-8", newline="\n")
+        replacements = [
+            transaction_replacement(source_path, "source", content)
+            for source_path, content in sorted(source_replacements.items(), key=lambda item: item[0].as_posix())
+        ]
+        replacements.extend(
+            [
+                transaction_replacement(paths.operations, "authority", append_jsonl_bytes(paths.operations, operation_records)),
+                transaction_replacement(paths.documents, "authority", append_jsonl_bytes(paths.documents, document_records)),
+                transaction_replacement(
+                    paths.offline_replayed,
+                    "authority",
+                    read_file_bytes(paths.offline_replayed) + read_file_bytes(paths.offline_queue),
+                ),
+                transaction_replacement(paths.offline_queue, "authority", b""),
+            ]
+        )
+        if index_records_to_append:
+            replacements.append(
+                transaction_replacement(paths.index, "authority", append_jsonl_bytes(paths.index, index_records_to_append))
+            )
+        run_file_transaction(paths, "replay-offline", replacements)
     output = {"queued_operations": len(queued), "affected_partitions": replayed}
     if args.format == "json":
         print(json.dumps(output, indent=2, sort_keys=True))
@@ -1641,7 +2133,11 @@ def status_report(root: Path, paths: StorePaths) -> dict[str, Any]:
         for record in latest.values()
         if record.get("state") == "active"
     ]
-    diagnostics = diagnostics + export_freshness_diagnostics(root, partitions)
+    diagnostics = (
+        diagnostics
+        + pending_transaction_diagnostics(paths)
+        + export_freshness_diagnostics(root, partitions)
+    )
     summary: dict[str, int] = {}
     for partition in partitions:
         status = str(partition["status"])
@@ -1691,6 +2187,18 @@ def command_status(args: argparse.Namespace) -> int:
         partition["status"] in failing for partition in report["partitions"]
     )
     return 1 if args.strict and failed else 0
+
+
+def command_recover(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    paths = store_paths(root, args.store)
+    with authority_write_lock(paths):
+        output = recover_pending_transactions(paths)
+    if args.format == "json":
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        print(f"recovered {len(output['recovered'])} transaction(s)")
+    return 0
 
 
 def command_resolve(args: argparse.Namespace) -> int:
@@ -1751,7 +2259,7 @@ def append_state_record(
 ) -> dict[str, Any]:
     current_epoch, current_epoch_hash = last_epoch(index_records)
     document_record_id = document_id(paths.root, relative_uri) if relative_uri else str(record["document_id"])
-    operation_record = append_operation(
+    operation_record = build_operation_record(
         paths,
         operations,
         transition,
@@ -1765,7 +2273,7 @@ def append_state_record(
     new_epoch_hash = epoch_hash(current_epoch_hash, operation_record["operation_hash"])
     evidence = record.get("evidence", {})
     accepted_line_hashes = evidence.get("line_hashes") if isinstance(evidence, dict) else None
-    return append_index_record(
+    index_record = build_index_record(
         paths,
         index_records,
         operation_record,
@@ -1786,6 +2294,10 @@ def append_state_record(
         evidence.get("line_count") if isinstance(evidence, dict) else None,
         evidence.get("byte_count") if isinstance(evidence, dict) else None,
     )
+    run_authority_record_transaction(paths, transition, [operation_record], [index_record])
+    operations.append(operation_record)
+    index_records.append(index_record)
+    return index_record
 
 
 @authority_mutation
@@ -1835,7 +2347,14 @@ def command_reconcile(args: argparse.Namespace) -> int:
             current_hash,
             "valid",
         )
-        append_document_record(paths, relative_uri, document_id(root, relative_uri), doc_hash, last_epoch(index_records)[1])
+        document_record = build_document_record(
+            paths,
+            relative_uri,
+            document_id(root, relative_uri),
+            doc_hash,
+            last_epoch(index_records)[1],
+        )
+        run_authority_record_transaction(paths, "relocate-document", document_records=[document_record])
         reconciled.append(partition_id)
     output = {"reconciled": reconciled, "count": len(reconciled)}
     if args.format == "json":
@@ -1897,7 +2416,7 @@ def command_reactivate(args: argparse.Namespace) -> int:
     current_hash = content_hash_text(current_text)
     doc_hash = document_hash_text(text)
     current_epoch, current_epoch_hash = last_epoch(index_records)
-    operation_record = append_operation(
+    operation_record = build_operation_record(
         paths,
         operations,
         "reactivate",
@@ -1909,7 +2428,7 @@ def command_reactivate(args: argparse.Namespace) -> int:
         [args.partition_id],
     )
     new_epoch_hash = epoch_hash(current_epoch_hash, operation_record["operation_hash"])
-    appended = append_index_record(
+    appended = build_index_record(
         paths,
         index_records,
         operation_record,
@@ -1927,7 +2446,14 @@ def command_reactivate(args: argparse.Namespace) -> int:
         current_text,
         "valid",
     )
-    append_document_record(paths, relative_uri, document_id(root, relative_uri), doc_hash, new_epoch_hash)
+    document_record = build_document_record(paths, relative_uri, document_id(root, relative_uri), doc_hash, new_epoch_hash)
+    run_authority_record_transaction(
+        paths,
+        "reactivate",
+        [operation_record],
+        [appended],
+        [document_record],
+    )
     if args.format == "json":
         print(json.dumps({"partition_id": args.partition_id, "index_record_hash": appended["index_record_hash"]}, indent=2, sort_keys=True))
     else:
@@ -1961,7 +2487,7 @@ def command_accept(args: argparse.Namespace) -> int:
     if current_hash != record.get("current_content_hash"):
         raise DemoError("current content hash does not match the latest managed range")
     current_epoch, current_epoch_hash = last_epoch(index_records)
-    operation_record = append_operation(
+    operation_record = build_operation_record(
         paths,
         operations,
         "accept",
@@ -1973,7 +2499,7 @@ def command_accept(args: argparse.Namespace) -> int:
         [args.partition_id],
     )
     new_epoch_hash = epoch_hash(current_epoch_hash, operation_record["operation_hash"])
-    accepted_record = append_index_record(
+    accepted_record = build_index_record(
         paths,
         index_records,
         operation_record,
@@ -1991,7 +2517,14 @@ def command_accept(args: argparse.Namespace) -> int:
         text[selected_range.start : selected_range.end],
         "valid",
     )
-    append_document_record(paths, relative_uri, str(record["document_id"]), doc_hash, new_epoch_hash)
+    document_record = build_document_record(paths, relative_uri, str(record["document_id"]), doc_hash, new_epoch_hash)
+    run_authority_record_transaction(
+        paths,
+        "accept",
+        [operation_record],
+        [accepted_record],
+        [document_record],
+    )
     if args.format == "json":
         print(
             json.dumps(
@@ -2402,7 +2935,13 @@ def serve_error_response(request: dict[str, Any] | None, error: Exception) -> di
     return {"ok": False, "error": str(error)}
 
 
-def make_http_server(root: Path, store: str, host: str, port: int) -> ThreadingHTTPServer:
+def make_http_server(
+    root: Path,
+    store: str,
+    host: str,
+    port: int,
+    max_request_bytes: int = HTTP_REQUEST_MAX_BYTES,
+) -> ThreadingHTTPServer:
     class UcfRequestHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             length_header = self.headers.get("Content-Length")
@@ -2411,7 +2950,10 @@ def make_http_server(root: Path, store: str, host: str, port: int) -> ThreadingH
                 return
             request: dict[str, Any] | None = None
             try:
-                length = int(length_header)
+                length = parse_http_content_length(length_header)
+                if length > max_request_bytes:
+                    self.send_json({"ok": False, "error": "request body too large"}, 413)
+                    return
                 payload = self.rfile.read(length)
                 decoded = json.loads(payload.decode("utf-8"))
                 if not isinstance(decoded, dict):
@@ -2439,7 +2981,20 @@ def make_http_server(root: Path, store: str, host: str, port: int) -> ThreadingH
 def command_serve(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     if args.transport == "http":
-        server = make_http_server(root, args.store, args.host, args.port)
+        if args.max_request_bytes < 1:
+            raise DemoError("--max-request-bytes must be positive")
+        if not is_loopback_host(args.host) and not args.unsafe_remote:
+            raise DemoError(
+                "refusing to bind HTTP transport to a non-loopback host without --unsafe-remote"
+            )
+        if args.unsafe_remote and not is_loopback_host(args.host):
+            print(
+                "warning: UCF-RS HTTP transport has no authentication or TLS; "
+                "remote binding is unsafe",
+                file=sys.stderr,
+                flush=True,
+            )
+        server = make_http_server(root, args.store, args.host, args.port, args.max_request_bytes)
         host, port = server.server_address
         print(f"ucf-rs listening on http://{host}:{port}", flush=True)
         if args.once:
@@ -2557,6 +3112,10 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--strict", action="store_true", help="return non-zero when action is required")
     status.set_defaults(func=command_status)
 
+    recover = subcommands.add_parser("recover", help="complete pending recoverable transactions")
+    recover.add_argument("--format", choices=("text", "json"), default="text")
+    recover.set_defaults(func=command_recover)
+
     export_ledger = subcommands.add_parser("export-ledger", help="write deterministic audit JSONL")
     export_ledger.add_argument("--output", default=EXPORT_LEDGER_DEFAULT)
     export_ledger.add_argument("--format", choices=("text", "json"), default="text")
@@ -2600,8 +3159,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = subcommands.add_parser("serve", help="serve JSONL or HTTP requests")
     serve.add_argument("--transport", choices=("stdio", "http"), default="stdio")
-    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--host", default="127.0.0.1", help="HTTP bind host, loopback by default")
     serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument(
+        "--max-request-bytes",
+        type=int,
+        default=HTTP_REQUEST_MAX_BYTES,
+        help=f"maximum HTTP request body size, default {HTTP_REQUEST_MAX_BYTES}",
+    )
+    serve.add_argument(
+        "--unsafe-remote",
+        action="store_true",
+        help="allow non-loopback HTTP binding; no authentication or TLS is provided",
+    )
     serve.add_argument("--once", action="store_true", help="handle one HTTP request and exit")
     serve.set_defaults(func=command_serve)
     return parser

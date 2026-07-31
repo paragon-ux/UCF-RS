@@ -13,6 +13,7 @@ Core commands:
 - `deactivate` / `reactivate`: append lifecycle records.
 - `resolve` / `citations`: emit overlays for a document.
 - `status`: validate authority records and current projection.
+- `recover`: complete pending recoverable transactions and emit structured recovery output.
 - `export ledger` / `export blocks`: write deterministic audit projections.
 - `render`: write generated status JSON and Markdown report.
 - `discover-reqtrace`: list advisory brownfield `@reqtrace` markers.
@@ -36,7 +37,18 @@ Server request methods:
 - `partition.accept`: accept the latest managed partition content.
 - `export.ledger`: write the deterministic ledger projection.
 
+HTTP transport defaults to `127.0.0.1`, enforces a maximum request body size, and
+rejects invalid `Content-Length` values. Binding to a non-loopback host requires
+`--unsafe-remote` and prints a warning. The HTTP transport has no authentication
+and no TLS; it is intended for trusted local use only.
+
 Offline replay stores the post-edit document text in `.ucf-rs/offline-queue.jsonl`
 so UCF-RS can replay the disconnected operation deterministically. Successful
 replay appends the queue content to `.ucf-rs/offline-replayed.jsonl` and clears
 the pending queue.
+
+`apply-edit`, `queue-offline-edit`, and `replay-offline` use recoverable file
+transactions for source-plus-authority consistency. Mutating commands recover
+pending transactions before reading mutable authority. Read-only status reports
+pending or malformed transactions as strict failures until `recover` completes
+or returns a stable diagnostic.
