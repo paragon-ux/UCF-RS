@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.error
 import urllib.request
 import unittest
 from pathlib import Path
@@ -554,6 +555,8 @@ class UcfRsDemoTests(unittest.TestCase):
             index = self.jsonl(root / ".ucf-rs" / "citation-index.jsonl")
             self.assertEqual([record["operation_type"] for record in operations], ["activate", "edit", "accept"])
             self.assertEqual([record["transition"] for record in index], ["activate", "edit-transform", "accept"])
+            self.assertEqual(operations[1]["affected_partitions"], ["AUTH-ROTATE/001"])
+            self.assertNotIn("refreshed_partitions", operations[1])
             self.assertIsNone(operations[0]["previous_operation_hash"])
             self.assertEqual(operations[1]["previous_operation_hash"], operations[0]["operation_hash"])
             self.assertEqual(operations[2]["previous_operation_hash"], operations[1]["operation_hash"])
@@ -593,8 +596,88 @@ class UcfRsDemoTests(unittest.TestCase):
             status = self.status(root)
             self.assertEqual(status["summary"], {"valid": 1})
             self.assertEqual(status["partitions"][0]["action"], "none")
-            self.assertEqual(len(self.jsonl(root / ".ucf-rs" / "citation-index.jsonl")), 1)
-            self.assertEqual(len(self.jsonl(root / ".ucf-rs" / "operation-log.jsonl")), 2)
+            index = self.jsonl(root / ".ucf-rs" / "citation-index.jsonl")
+            operations = self.jsonl(root / ".ucf-rs" / "operation-log.jsonl")
+            self.assertEqual(len(index), 2)
+            self.assertEqual(len(operations), 2)
+            self.assertEqual(index[-1]["transition"], "edit-refresh")
+            self.assertEqual(index[-1]["transform_status"], "unaffected")
+            self.assertEqual(operations[-1]["affected_partitions"], [])
+            self.assertEqual(operations[-1]["refreshed_partitions"], ["AUTH-ROTATE/001"])
+
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "apply-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        "0",
+                        "--end",
+                        "0",
+                        "--insert",
+                        "head\n",
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(self.status(root)["summary"], {"valid": 1})
+            index = self.jsonl(root / ".ucf-rs" / "citation-index.jsonl")
+            operations = self.jsonl(root / ".ucf-rs" / "operation-log.jsonl")
+            self.assertEqual(len(index), 3)
+            self.assertEqual(len(operations), 3)
+            self.assertEqual(index[-1]["transition"], "edit-transform")
+            self.assertEqual(operations[-1]["affected_partitions"], ["AUTH-ROTATE/001"])
+            self.assertNotIn("refreshed_partitions", operations[-1])
+
+    def test_edit_index_records_must_be_covered_by_matching_operation_fields(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            original = "alpha\nbeta\n"
+            self.write(source, original)
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "apply-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        str(len(original)),
+                        "--end",
+                        str(len(original)),
+                        "--insert",
+                        "tail\n",
+                    ]
+                ),
+                0,
+            )
+
+            index_path = root / ".ucf-rs" / "citation-index.jsonl"
+            index = self.jsonl(index_path)
+            self.assertEqual(index[-1]["transition"], "edit-refresh")
+            index[-1]["transition"] = "edit-transform"
+            index[-1].pop("index_record_hash")
+            index[-1]["index_record_hash"] = ucf.index_record_hash(index[-1])
+            self.write(
+                index_path,
+                "\n".join(
+                    json.dumps(record, sort_keys=True, separators=(",", ":"))
+                    for record in index
+                )
+                + "\n",
+            )
+
+            status = self.status(root)
+            codes = {diagnostic["code"] for diagnostic in status["diagnostics"]}
+            self.assertIn("E_INDEX_OPERATION_COVERAGE", codes)
+            self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 1)
 
     def test_boundary_insert_policies_distinguish_outside_from_inside(self) -> None:
         with self.make_root() as directory:
@@ -683,6 +766,11 @@ class UcfRsDemoTests(unittest.TestCase):
             status = self.status(root)
             self.assertEqual(status["summary"], {"missing": 1})
             self.assertEqual(status["partitions"][0]["action"], "redeclare_partition")
+            self.assertEqual(
+                ucf.main(["--root", str(root), "accept", "--partition-id", "AUTH-ROTATE/001"]),
+                2,
+            )
+            self.assertEqual(self.status(root)["summary"], {"missing": 1})
 
     def test_duplicate_exact_unmanaged_recovery_is_ambiguous(self) -> None:
         with self.make_root() as directory:
@@ -956,6 +1044,92 @@ class UcfRsDemoTests(unittest.TestCase):
                 1,
             )
 
+    def test_offline_replay_refreshes_unaffected_partition_revision(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            original = "alpha\nbeta\n"
+            self.write(source, original)
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "queue-offline-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        str(len(original)),
+                        "--end",
+                        str(len(original)),
+                        "--insert",
+                        "tail\n",
+                    ]
+                ),
+                0,
+            )
+            queued_records = self.jsonl(root / ".ucf-rs" / "offline-queue.jsonl")
+            self.assertEqual(queued_records[-1]["affected_partitions"], [])
+            self.assertEqual(queued_records[-1]["refreshed_partitions"], ["AUTH-ROTATE/001"])
+            self.assertEqual(self.status(root)["summary"], {"valid": 1})
+            self.assertEqual(ucf.main(["--root", str(root), "replay-offline"]), 0)
+            self.assertEqual(self.status(root)["summary"], {"valid": 1})
+            index_after_replay = self.jsonl(root / ".ucf-rs" / "citation-index.jsonl")
+            operations_after_replay = self.jsonl(root / ".ucf-rs" / "operation-log.jsonl")
+            self.assertEqual(len(index_after_replay), 2)
+            self.assertEqual(index_after_replay[-1]["transition"], "edit-refresh")
+            self.assertEqual(index_after_replay[-1]["transform_status"], "unaffected")
+            self.assertEqual(operations_after_replay[-1]["affected_partitions"], [])
+            self.assertEqual(operations_after_replay[-1]["refreshed_partitions"], ["AUTH-ROTATE/001"])
+
+            self.assertEqual(
+                ucf.main(
+                    [
+                        "--root",
+                        str(root),
+                        "apply-edit",
+                        "--path",
+                        "src/auth.py",
+                        "--start",
+                        "0",
+                        "--end",
+                        "0",
+                        "--insert",
+                        "head\n",
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(self.status(root)["summary"], {"valid": 1})
+
+    def test_offline_replay_conflicts_on_refreshed_partition_suffix(self) -> None:
+        queued = {
+            "base_server_epoch_hash": ucf.GENESIS_EPOCH_HASH,
+            "base_operation_hash": None,
+            "document_id": "doc-a",
+            "affected_partitions": [],
+            "refreshed_partitions": ["AUTH-ROTATE/001"],
+        }
+        operations = [
+            {
+                "operation_hash": "sha256:" + "1" * 64,
+                "document_id": "doc-b",
+                "operation_type": "edit",
+                "affected_partitions": [],
+                "refreshed_partitions": ["AUTH-ROTATE/001"],
+            }
+        ]
+
+        with self.assertRaises(ucf.DemoError):
+            ucf.validate_offline_replay_base(
+                operations,
+                [],
+                queued,
+                ucf.GENESIS_EPOCH_HASH,
+            )
+
     def test_stale_export_is_a_strict_status_failure_until_regenerated(self) -> None:
         with self.make_root() as directory:
             root = Path(directory)
@@ -988,7 +1162,8 @@ class UcfRsDemoTests(unittest.TestCase):
             self.assertIn("E_EXPORT_STALE", report["summary"])
             self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 1)
 
-            self.assertEqual(ucf.main(["--root", str(root), "export", "ledger"]), 0)
+            exported = self.run_json(["--root", str(root), "export", "ledger"])
+            self.assertTrue(exported["status_valid"])
             fresh = self.status(root)
             self.assertNotIn("E_EXPORT_STALE", fresh["summary"])
 
@@ -1181,6 +1356,36 @@ class UcfRsDemoTests(unittest.TestCase):
             self.assertEqual(payload["jsonrpc"], "2.0")
             self.assertEqual(payload["id"], "resolve-1")
             self.assertEqual(payload["result"]["overlays"][0]["partition_id"], "AUTH-ROTATE/001")
+
+    def test_http_transport_reports_malformed_mutating_params_as_json_error(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            self.write(source, "alpha\nbeta\n")
+            self.assertEqual(self.activate(root, "src/auth.py", "1:2"), 0)
+
+            server = ucf.make_http_server(root, ucf.STORE_DEFAULT, "127.0.0.1", 0)
+            thread = threading.Thread(target=server.handle_request)
+            thread.start()
+            try:
+                body = json.dumps(
+                    {"method": "document.apply_edit", "params": {"path": "src/auth.py"}}
+                ).encode("utf-8")
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_address[1]}",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=5)
+                payload = json.loads(raised.exception.read().decode("utf-8"))
+            finally:
+                thread.join(timeout=5)
+                server.server_close()
+
+            self.assertFalse(payload["ok"])
+            self.assertIn("document.apply_edit requires integer params.start", payload["error"])
 
     def post_raw_http(
         self,

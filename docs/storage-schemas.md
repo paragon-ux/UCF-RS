@@ -9,11 +9,11 @@ projections over that authority.
 | Path | Class | Purpose | Hash Boundary |
 | --- | --- | --- | --- |
 | `.ucf-rs/project.json` | Authoritative metadata | Project identity, root, tool metadata, and authority file names. | Not part of operation or citation-index record hashes. |
-| `.ucf-rs/operation-log.jsonl` | Authoritative append-only log | Managed source operations, affected partitions, before/after document hashes, and operation chain links. | Each record is hashed as `ucf.operation.v1` over canonical JSON without `operation_hash`. |
+| `.ucf-rs/operation-log.jsonl` | Authoritative append-only log | Managed source operations, affected/refreshed partitions, before/after document hashes, and operation chain links. | Each record is hashed as `ucf.operation.v1` over canonical JSON without `operation_hash`. |
 | `.ucf-rs/citation-index.jsonl` | Authoritative append-only index | Citation lifecycle state, accepted evidence hashes, current evidence hashes, ranges, and server epoch chain. | Each record is hashed as `ucf.index_record.v1` over canonical JSON without `index_record_hash`. |
 | `.ucf-rs/document-index.jsonl` | Authoritative revision index | Current known filesystem text revision for each document. | Records are append-only but are not inputs to operation or citation-index hashes. |
 | `.ucf-rs/handle-cache.jsonl` | Authoritative local handle cache | Imported Reqtrace-compatible handle registry records. | Records are schema-checked by command paths, not chained into operation/index hashes. |
-| `.ucf-rs/offline-queue.jsonl` | Local replay authority | Pending disconnected edits, including replay text and queue chain hash. | Each record is hashed as `ucf.offline_operation.v1`; this hash is separate from operation/index canonical hashes. |
+| `.ucf-rs/offline-queue.jsonl` | Local replay authority | Pending disconnected edits, affected/refreshed partition context, replay text, and queue chain hash. | Each record is hashed as `ucf.offline_operation.v1`; this hash is separate from operation/index canonical hashes. |
 | `.ucf-rs/offline-replayed.jsonl` | Local replay archive | Consumed offline queue records after successful replay. | Archive records retain their offline hashes; they are not accepted evidence and do not alter operation/index hash domains. |
 | `.ucf-rs/snapshots/` | Reserved operational storage | Local runtime snapshots when present. | Provider/runtime data only; not canonical citation authority. |
 | `.ucf-rs/transactions/*.json` | Recoverable consistency metadata | Pending and committed file transaction manifests for source-plus-authority writes. | Transaction file hashes use `ucf.transaction_file.v1` and are outside operation/index canonical hashes. |
@@ -61,6 +61,8 @@ Unsupported or malformed authoritative records fail closed:
 - hash mismatches produce fatal diagnostics;
 - operation chain gaps produce fatal diagnostics;
 - citation-index references to missing operations produce fatal diagnostics;
+- edit citation-index records not covered by matching operation partition fields
+  produce fatal diagnostics;
 - invalid server epoch ordering produces fatal diagnostics;
 - invalid offline queue chain order blocks queue append and replay.
 
@@ -74,6 +76,8 @@ replay disconnected edits deterministically. It is not accepted evidence, and
 successful replay is not implicit citation acceptance. Successful replay appends
 normal operation and citation-index records, then archives the consumed queue
 records in `.ucf-rs/offline-replayed.jsonl`.
+Queued records preserve affected and refreshed partition context so replay
+conflict checks can detect intervening touches to the same partition.
 
 The replay archive is retained operational history. It is not a canonical
 operation log and does not replace the append-only operation/index authority.
@@ -102,6 +106,7 @@ history, but they are not part of canonical operation or citation-index hashes.
 | Source files remain clean unless a managed edit command changes document text. | Public clients use typed commands; raw CRDT changes are not the normal agent contract. |
 | Citation activation uses an explicit selected range and records accepted evidence hashes. | `citation.activate` creates a stable citation over an explicit selection with accepted evidence hash. |
 | Managed edits before a citation preserve validity through range transformation. | Relative anchors resolve identically after synchronization and preserve citation validity for outside edits. |
+| Managed edits outside a citation append `edit-refresh` records for unchanged active partitions. | Unchanged anchors still refresh document revision authority so future managed edits are not misclassified as unmanaged. |
 | Managed edits inside accepted evidence become `changed_unaccepted`. | Structural convergence never implies semantic acceptance. |
 | Whole-partition deletion is classified as missing. | Deleted or unresolved anchors yield a typed missing or unresolved status. |
 | Unmanaged source changes are not implicitly accepted. | Changed evidence requires `citation.accept_current` before acceptance. |

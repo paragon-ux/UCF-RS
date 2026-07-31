@@ -5,7 +5,7 @@ Core commands:
 - `init`: create `.ucf-rs/` files and import Reqtrace handles when present.
 - `preflight`: validate an activation without mutation.
 - `activate`: accept an explicit text range without editing source.
-- `apply-edit`: apply a managed text edit and transform affected ranges.
+- `apply-edit`: apply a managed text edit and transform or refresh active ranges.
 - `queue-offline-edit`: record and apply a local offline edit without mutating authority.
 - `replay-offline`: replay queued offline edits through the operation log and citation index.
 - `accept`: promote current managed evidence to accepted evidence.
@@ -31,7 +31,7 @@ Server request methods:
 - `session.open`: return a session id, document revision hash, and server epoch.
 - `partition.preflight`: validate a partition activation without mutating authority.
 - `partition.activate`: append activation operation and citation-index records.
-- `document.apply_edit`: apply a managed edit delta and transform affected ranges.
+- `document.apply_edit`: apply a managed edit delta and transform or refresh active ranges.
 - `document.queue_offline_edit`: queue and apply a local disconnected edit.
 - `offline.replay`: replay queued offline edits through authoritative operation records.
 - `partition.accept`: accept the latest managed partition content.
