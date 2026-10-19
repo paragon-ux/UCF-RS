@@ -14,12 +14,12 @@ Before publishing, the following verification battery passed on `release-prep`:
 
 - **Version consistency (`scripts/check_versions.py`)**: `scripts/ucf_rs.py`
   (`TOOL_VERSION = "0.3.0"`), `pyproject.toml` (`version = "0.3.0"`), and
-  `package.json` (`"version": "0.3.0"`) agree.
+  `package.json` (`"version": "0.3.0"`) agree on `0.3.0`.
 - **Python compile check**: All scripts in `scripts/` and tests in `tests/` compile
   without syntax errors under Python standard library.
-- **Unit test battery (`tests/`)**: 75+ tests pass with zero failures.
-- **Status fixture (`scripts/ci_status_fixture.py`)**: Deterministic release status
-  fixture passes.
+- **Unit test battery (`tests/`)**: 75 tests pass with zero failures.
+- **Release status fixture (`scripts/ci_status_fixture.py`)**: Deterministic release
+  status fixture passes.
 - **Package dry-run validation (`scripts/check_package.py`)**: Verified that
   `npm pack --dry-run` includes only the expected files and contains zero test,
   scratch, cache, or machine-specific paths (`C:\Users`, `.gemini`, `brain`, etc.).
@@ -33,22 +33,45 @@ Before publishing, the following verification battery passed on `release-prep`:
 
 ---
 
-## 2. Setting Up npm Trusted Publishing (OIDC)
+## 2. First-Publish Options & Trusted Publisher Setup
 
-UCF-RS uses GitHub Actions OIDC Trusted Publishing (`id-token: write`) to publish
-to the public npm registry without storing long-lived, static npm credentials.
+Because `ucf-rs` is a new package on the npm registry, the package must exist
+before package-level settings can be configured. Choose one of two routes for the
+very first publish:
 
-### Step 2.1: Configure Trusted Publisher on npmjs.com
+### Route A: Manual First Publish with 2FA (Recommended)
+1. Run `scripts/check_package.py` to ensure package cleanliness.
+2. Publish `0.3.0` directly from your local terminal:
+   ```bash
+   npm publish --access public
+   ```
+   *(npm will prompt for your 2FA authentication code.)*
+3. Once published, proceed to configure the GitHub Actions Trusted Publisher for
+   all subsequent releases.
+
+### Route B: Workstation Staging (Placeholder Route)
+1. From your local terminal, initialize staging with a `0.0.0-stage` version:
+   ```bash
+   npm stage publish --access public
+   ```
+2. Approve the staged release via npmjs.com, establishing the package namespace.
+3. Configure GitHub Actions Trusted Publishing to handle the `0.3.0` release.
+
+---
+
+## 3. Configuring npm Trusted Publishing (OIDC)
+
+Once the package namespace exists on npm:
 
 1. Log into your npm account on [https://www.npmjs.com](https://www.npmjs.com) (with 2FA enabled).
-2. Go to **Account Settings** &rarr; **Publishing** (or navigate to package settings if creating a new version of an existing package).
-3. Under **Trusted Publishers**, click **Add Trusted Publisher**:
+2. Go to **Package Settings** (`ucf-rs`) &rarr; **Publishing** &rarr; **Add Trusted Publisher**:
    - **Publisher Type**: `GitHub Actions`
    - **Repository Owner**: `paragon-ux`
    - **Repository Name**: `UCF-RS`
-   - **Workflow Name**: `release.yml`
-   - **Environment Name**: Leave empty (or `npm-release` if you configure a matching GitHub environment).
-4. Save the configuration.
+   - **Workflow Name**: `release.yml` (exact filename with extension)
+   - **Environment Name**: Leave empty (none)
+   - **Allowed Actions**: Staged publishing (or Staged + Direct Publish)
+3. Save the configuration.
 
 > [!WARNING]
 > **48-Hour Expiration Rule**: npm enforces that a newly created trusted publisher
@@ -56,95 +79,80 @@ to the public npm registry without storing long-lived, static npm credentials.
 > If unused after 2 days, npm marks the pending publisher as expired and it cannot
 > be edited — you must delete it and recreate it.
 
-### Step 2.2: Staged Publishing & 2FA Approval
-
-On new GitHub Actions Trusted Publisher configurations, **Staged Publishing** is
-enabled by default by npm:
-- When the `release.yml` GitHub Actions workflow runs, it initiates `npm stage publish`
-  using the short-lived OIDC token.
-- npm stages the package and generates a publish request ID.
-- Maintainers with 2FA on the npm package will receive an email and notification
-  prompt on npmjs.com.
-- Go to the package page on [https://www.npmjs.com/package/ucf-rs](https://www.npmjs.com/package/ucf-rs),
-  review the staged release, and click **Approve** (providing your 2FA token).
-- Once approved, the package is immediately released and published to the public registry.
+### Hardening npm Package Settings
+After configuring the trusted publisher:
+- In package settings, select **"Require two-factor authentication to publish"**.
+- Ensure classic automation tokens are disabled or disallow token publishing so
+  only OIDC short-lived tokens are accepted.
 
 ---
 
-## 3. Cutting the Release
+## 4. GitHub Repository Configuration
 
-### Step 3.1: Merge `release-prep` to `main`
+Ensure the following repository settings are active on GitHub:
 
-Push your local `release-prep` branch to GitHub or open a Pull Request into `main`:
+1. **GitHub Pages Deployment**:
+   - Go to **Settings** &rarr; **Pages**.
+   - Under **Build and deployment** &rarr; **Source**, select **GitHub Actions**.
+   - The `.github/workflows/docs.yml` workflow will automatically build and deploy
+     the Zensical documentation site on pushes to `main`.
+2. **Tag Protection**:
+   - Go to **Settings** &rarr; **Rules** &rarr; **Tag rules**.
+   - Add a rule targeting `v*` to prevent unauthorized tag deletion or overwriting.
+3. **Private Vulnerability Reporting**:
+   - Go to **Settings** &rarr; **Security** &rarr; **Advisories**.
+   - Ensure **Private vulnerability reporting** is turned on.
 
+---
+
+## 5. Cutting the Release
+
+### Step 5.1: Merge `release-prep` to `main`
 ```bash
 git checkout main
 git merge release-prep
 git push origin main
 ```
 
-### Step 3.2: Tag and Push `v0.3.0`
-
-Create an annotated git tag matching the package version and push it:
-
+### Step 5.2: Tag and Push `v0.3.0`
+Run these exact commands to trigger the release workflow:
 ```bash
 git tag -a v0.3.0 -m "Release v0.3.0"
 git push origin v0.3.0
 ```
 
-Pushing the tag triggers `.github/workflows/release.yml`, which:
-1. Runs the full test suite and metadata checks across platforms.
-2. Builds the publish tarball (`ucf-rs-0.3.0.tgz`).
-3. Creates a GitHub Release draft with the attached tarball and release notes.
-4. Initiates npm publishing via OIDC.
+---
+
+## 6. Approving the Staged npm Release
+
+When `.github/workflows/release.yml` runs on the tag push:
+1. The `verify` job runs compile checks, unit tests, and smoke tests across Ubuntu,
+   macOS, and Windows.
+2. The `publish` job runs `npm stage publish` using short-lived OIDC tokens.
+3. As the package maintainer, approve the staged publication:
+   - **Web UI**: Navigate to [https://www.npmjs.com/package/ucf-rs](https://www.npmjs.com/package/ucf-rs)
+     and click **Approve** (enter your 2FA code).
+   - **CLI**: Alternatively, run `npm stage list` and `npm stage approve <request-id>`.
+4. Once approved, the package is immediately released to the public registry.
+5. The `draft-release` job creates a draft release on GitHub with `ucf-rs-0.3.0.tgz`
+   and release notes attached. Review and publish the draft release.
 
 ---
 
-## 4. Fallback: Manual or Token-Based Publishing
+## 7. Post-Publish Verification
 
-If npm Trusted Publishing cannot be configured or fails:
-
-### Option A: Local CLI Publish (Maintainer Machine)
-
-Run from the repository root:
+Once the package is live, execute these sanity checks:
 
 ```bash
-# Ensure clean working directory
-git checkout v0.3.0
-
-# Verify tarball contents
-python scripts/check_package.py
-
-# Publish with 2FA
-npm publish --access public
-```
-
-### Option B: GitHub Actions with `NPM_TOKEN`
-
-If using a classic automation secret:
-1. Generate an npm access token on npmjs.com with publish permissions.
-2. In GitHub repository settings &rarr; **Secrets and variables** &rarr; **Actions**,
-   add `NPM_TOKEN`.
-3. The `release.yml` workflow will automatically fall back to using `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}`.
-
----
-
-## 5. Post-Publish Verification
-
-Once published, run these verification steps:
-
-```bash
-# 1. Verify npm package is visible on registry
+# 1. Verify package visibility on npm
 npm view ucf-rs
 
-# 2. Test running without local repository
+# 2. Verify global execution via npx
 npx ucf-rs@0.3.0 --help
 
-# 3. Verify documentation deployment
+# 3. Verify documentation deployment on Pages
 curl -I https://paragon-ux.github.io/UCF-RS/
 ```
 
-- Check [https://github.com/paragon-ux/UCF-RS/releases/tag/v0.3.0](https://github.com/paragon-ux/UCF-RS/releases/tag/v0.3.0)
-  to ensure the release notes and `ucf-rs-0.3.0.tgz` asset are present.
-- Visit [https://paragon-ux.github.io/UCF-RS/](https://paragon-ux.github.io/UCF-RS/)
-  to confirm the Zensical documentation site deployed successfully via GitHub Pages.
+- Add the npm version badge to `README.md` in a follow-up commit:
+  `[![npm version](https://img.shields.io/npm/v/ucf-rs)](https://www.npmjs.com/package/ucf-rs)`
