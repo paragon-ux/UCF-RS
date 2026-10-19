@@ -1,4 +1,4 @@
-# UCF-RS
+# Universal Citation Format — Runtime Server (UCF-RS)
 
 **Source-clean citation tracking: cite code ranges without writing markers into source files.**
 
