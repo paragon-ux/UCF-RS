@@ -1,0 +1,42 @@
+{
+  "name": "ucf-rs",
+  "version": "0.3.0",
+  "description": "Source-clean citation tracking: cite code ranges without writing markers into source files. A launcher for the bundled Python script.",
+  "license": "MIT",
+  "author": "paragon-ux",
+  "type": "commonjs",
+  "bin": {
+    "ucf-rs": "bin/ucf-rs.js"
+  },
+  "files": [
+    "bin/ucf-rs.js",
+    "scripts/ucf_rs.py",
+    "docs/agent-guide.md",
+    "docs/commands.md",
+    "docs/user-guide.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paragon-ux/UCF-RS.git"
+  },
+  "homepage": "https://paragon-ux.github.io/UCF-RS/",
+  "bugs": {
+    "url": "https://github.com/paragon-ux/UCF-RS/issues"
+  },
+  "keywords": [
+    "traceability",
+    "citations",
+    "requirements",
+    "audit",
+    "ai-agents",
+    "cli"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -31,7 +31,7 @@ else:
     import fcntl
 
 TOOL_NAME = "ucf-rs"
-TOOL_VERSION = "0.2.0"
+TOOL_VERSION = "0.3.0"
 
 STORE_DEFAULT = ".ucf-rs"
 EXPORT_LEDGER_DEFAULT = "docs/ucf-trace-ledger.jsonl"

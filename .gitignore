@@ -1,8 +1,31 @@
+# Local planning material and scratch space
 build-docs/
-.ucf-rs/
 .tmp-test/
-__pycache__/
-*.pyc
+.tmp-*/
+scratch/
+
+# UCF-RS authority store (never committed; this repo is not a UCF-RS project)
+.ucf-rs/
+
+# Generated UCF-RS projections
 docs/ucf-trace-ledger.jsonl
 docs/ucf-trace-status.json
 docs/ucf-trace-report.md
+
+# Documentation site build output
+site/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+
+# npm
+node_modules/
+*.tgz

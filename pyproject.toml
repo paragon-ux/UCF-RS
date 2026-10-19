@@ -1,10 +1,88 @@
+[build-system]
+# Only used to install the optional tool extras below (for example
+# `pip install ".[docs]"`). UCF-RS itself is one standard-library script and
+# is not published to PyPI.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ucf-rs"
-version = "0.1.0"
-description = "Overlay-first citation runtime for source-clean traceability"
+version = "0.3.0"
+description = "Source-clean citation tracking: cite code ranges without writing markers into source files"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "paragon-ux" }]
+keywords = ["traceability", "citations", "requirements", "audit", "ai-agents"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Quality Assurance",
+  # Stops an accidental upload to PyPI. The npm package is the distribution.
+  "Private :: Do Not Upload",
+]
+# No runtime dependencies: the core is standard-library only.
+dependencies = []
+
+[project.optional-dependencies]
+# Tools used in CI and for local development only. Exact pins on purpose.
+dev = [
+  "ruff==0.17.1",
+  "mypy==2.4.0",
+]
+docs = [
+  # Zensical is pre-1.0, so pin the exact version.
+  "zensical==0.0.71",
+]
+
+[project.urls]
+Homepage = "https://paragon-ux.github.io/UCF-RS/"
+Documentation = "https://paragon-ux.github.io/UCF-RS/"
+Repository = "https://github.com/paragon-ux/UCF-RS"
+Issues = "https://github.com/paragon-ux/UCF-RS/issues"
+Changelog = "https://github.com/paragon-ux/UCF-RS/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+# There is no importable package; scripts/ucf_rs.py runs directly.
+packages = []
 
 [tool.ucf-rs]
 runtime = "stdlib"
 authority = ".ucf-rs"
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+# Baseline: syntax errors, undefined names, unused imports, and the E4/E7 style
+# checks. Broader rule sets (import order, pyupgrade, bugbear-style) report
+# about a dozen cosmetic findings and are left off until someone ratchets them
+# in on purpose. `ruff format` is not enforced: it would reformat four files.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# command_activate assigns `root` and never uses it. Harmless dead code in the
+# core script; left alone in the release pass.
+"scripts/ucf_rs.py" = ["F841"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["scripts"]
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+# Baseline: ten findings in the core script, all typing-annotation mismatches
+# (platform-specific fcntl/msvcrt imports, a decorator attribute, dict value
+# inference, and the HTTP server address tuple), not behavior bugs. They are
+# silenced by error code for this one module so new modules stay fully checked.
+module = ["ucf_rs"]
+disable_error_code = ["arg-type", "attr-defined", "index", "misc", "str-bytes-safe"]

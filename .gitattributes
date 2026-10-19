@@ -1,0 +1,4 @@
+# UCF-RS hashes normalized text, and CI compares Windows with Linux.
+# Check files out with LF everywhere so both behave the same.
+* text=auto eol=lf
+*.docx binary
