@@ -2179,6 +2179,64 @@ class UcfRsDemoTests(unittest.TestCase):
             self.assertEqual(len(json.loads(recovered.stdout)["recovered"]), 1)
             self.assertEqual(self.status(root)["summary"], {"changed_unaccepted": 1})
 
+    def test_status_on_uninitialized_store_emits_diagnostic_and_fails_strict(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            uninitialized = self.status(root)
+            self.assertFalse(uninitialized["ledger"]["valid"])
+            self.assertEqual(uninitialized["summary"], {"E_STORE_UNINITIALIZED": 1})
+            self.assertEqual(len(uninitialized["diagnostics"]), 1)
+            self.assertEqual(uninitialized["diagnostics"][0]["code"], "E_STORE_UNINITIALIZED")
+            self.assertEqual(uninitialized["diagnostics"][0]["path"], ".ucf-rs")
+            self.assertEqual(ucf.main(["--root", str(root), "status"]), 0)
+            self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 1)
+
+            self.assertEqual(ucf.main(["--root", str(root), "init"]), 0)
+            initialized = self.status(root)
+            self.assertTrue(initialized["ledger"]["valid"])
+            self.assertEqual(initialized["summary"], {})
+            self.assertEqual(initialized["diagnostics"], [])
+            self.assertEqual(ucf.main(["--root", str(root), "status", "--strict"]), 0)
+
+    def test_validation_errors_consistently_return_exit_code_2(self) -> None:
+        with self.make_root() as directory:
+            root = Path(directory)
+            source = root / "src" / "auth.py"
+            self.write(source, "alpha\nbeta\n")
+
+            invalid_invocations = [
+                ["--root", str(root), "preflight", "--handle", "UNKNOWN-HANDLE", "--path", "src/auth.py", "--lines", "1:1"],
+                ["--root", str(root), "preflight", "--handle", "AUTH-ROTATE", "--path", "src/auth.py", "--lines", "9:1"],
+                ["--root", str(root), "preflight", "--handle", "AUTH-ROTATE", "--path", "src/missing.py", "--lines", "1:1"],
+                ["--root", str(root), "activate", "--handle", "AUTH-ROTATE", "--path", "src/auth.py"],
+                ["--root", str(root), "unknown-subcommand"],
+            ]
+            for argv in invalid_invocations:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(ucf.main(argv), ucf.EXIT_VALIDATION_ERROR, msg=f"argv={argv}")
+
+            cli_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "--root",
+                    str(root),
+                    "preflight",
+                    "--handle",
+                    "UNKNOWN-HANDLE",
+                    "--path",
+                    "src/auth.py",
+                    "--lines",
+                    "1:1",
+                ],
+                cwd=str(REPOSITORY_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(cli_proc.returncode, ucf.EXIT_VALIDATION_ERROR)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -81,3 +81,14 @@ source/authority divergence without accepting evidence.
 
 Fault-injection environment variables are ignored unless
 `UCF_RS_ENABLE_FAULT_INJECTION=1` is also set. They are test/debug hooks only.
+
+## Exit codes
+
+All CLI commands follow a consistent exit-code contract:
+
+- `0` (`EXIT_OK`): command succeeded (`status` without `--strict` also returns `0` while reporting diagnostics in JSON/stderr).
+- `1` (`EXIT_CHECK_FAILURE`): operational check failure:
+  - `status --strict` when any diagnostic is present (including `E_STORE_UNINITIALIZED` on an uninitialized store) or any active partition requires action (`ambiguous`, `boundary_touched`, `changed_unaccepted`, `missing`, `unmanaged_external_change`, `valid_moved`).
+  - `reconcile --partition-id ID` when the requested partition was not reconciled.
+  - `session open` when store diagnostics are present.
+- `2` (`EXIT_VALIDATION_ERROR`): CLI argument validation failure (`argparse`), semantic validation / precondition failure (`DemoError`, printed to `stderr` as `error: ...`), or `E_RECOVERY_RETRY_REQUIRED` when a mutating command first recovers a pending transaction.

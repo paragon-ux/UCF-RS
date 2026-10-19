@@ -39,6 +39,10 @@ EXPORT_STATUS_DEFAULT = "docs/ucf-trace-status.json"
 EXPORT_REPORT_DEFAULT = "docs/ucf-trace-report.md"
 HTTP_REQUEST_MAX_BYTES = 1024 * 1024
 
+EXIT_OK = 0
+EXIT_CHECK_FAILURE = 1
+EXIT_VALIDATION_ERROR = 2
+
 PROJECT_SCHEMA = "ucf-rs.project.v1"
 INDEX_SCHEMA = "ucf-rs.index.v1"
 OPERATION_SCHEMA = "ucf-rs.operation.v1"
@@ -2406,6 +2410,19 @@ def partition_status(root: Path, paths: StorePaths, record: dict[str, Any]) -> d
     return base
 
 
+def store_initialization_diagnostics(paths: StorePaths) -> list[dict[str, Any]]:
+    if paths.project.exists() or paths.index.exists() or paths.operations.exists():
+        return []
+    return [
+        {
+            "code": "E_STORE_UNINITIALIZED",
+            "severity": "error",
+            "message": "UCF-RS store is not initialized; run 'init' first",
+            "path": relative_path(paths.root, paths.store),
+        }
+    ]
+
+
 def status_report(root: Path, paths: StorePaths) -> dict[str, Any]:
     operations, index_records, diagnostics = read_store(paths)
     latest = latest_index_records(index_records)
@@ -2415,7 +2432,8 @@ def status_report(root: Path, paths: StorePaths) -> dict[str, Any]:
         if record.get("state") == "active"
     ]
     diagnostics = (
-        diagnostics
+        store_initialization_diagnostics(paths)
+        + diagnostics
         + pending_transaction_diagnostics(paths)
         + export_freshness_diagnostics(root, partitions)
     )
@@ -2467,7 +2485,7 @@ def command_status(args: argparse.Namespace) -> int:
     failed = bool(report["diagnostics"]) or any(
         partition["status"] in failing for partition in report["partitions"]
     )
-    return 1 if args.strict and failed else 0
+    return EXIT_CHECK_FAILURE if args.strict and failed else EXIT_OK
 
 
 def command_recover(args: argparse.Namespace) -> int:
@@ -3636,12 +3654,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        if exc.code == 0:
+            return EXIT_OK
+        return EXIT_VALIDATION_ERROR
     try:
         return args.func(args)
     except DemoError as error:
         print(f"error: {error}", file=sys.stderr)
-        return 2
+        return EXIT_VALIDATION_ERROR
 
 
 if __name__ == "__main__":
