@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Release Gate — Python ${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.12", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b # v4.2.0
+        with:
+          node-version: 22
+
+      - name: Ensure tag matches manifest version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python scripts/check_versions.py --tag "${{ github.ref_name }}"
+
+      - name: Python compile check
+        run: python -c "import pathlib, py_compile; [py_compile.compile(str(path), doraise=True) for path in [*pathlib.Path('scripts').glob('*.py'), *pathlib.Path('tests').glob('*.py')]]"
+
+      - name: Run unit test suite
+        run: python -m unittest discover -s tests
+
+      - name: Verify release status fixture
+        run: python scripts/ci_status_fixture.py
+
+      - name: Check package contents dry-run
+        run: python scripts/check_package.py
+
+      - name: Run npm smoke test
+        run: python scripts/smoke_npm_install.py
+
+  publish:
+    name: Publish npm Package and GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b # v4.2.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Ensure npm CLI supports trusted publishing
+        run: |
+          npm install --global 'npm@^11.5.1'
+          node --version
+          npm --version
+
+      - name: Check package contents
+        run: python scripts/check_package.py
+
+      - name: Build publish tarball
+        id: pack
+        run: |
+          tarball="$(npm pack)"
+          echo "Built tarball: ${tarball}"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          tag="${{ github.ref_name }}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.pack.outputs.tag }}"
+          tarball="${{ steps.pack.outputs.tarball }}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${tarball}" --clobber
+          else
+            gh release create "${tag}" "${tarball}" --verify-tag --generate-notes
+          fi
+
+      - name: Publish to npm (OIDC Trusted Publishing or NPM_TOKEN)
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "${NPM_TOKEN}" ]; then
+            echo "Publishing via NPM_TOKEN secret..."
+            npm config set //registry.npmjs.org/:_authToken "${NPM_TOKEN}"
+            npm publish --access public
+          else
+            echo "Publishing via OIDC Trusted Publishing (id-token)..."
+            if npm stage publish --help >/dev/null 2>&1; then
+              echo "Staging publish (maintainer 2FA approval on npmjs.com required)..."
+              npm stage publish --access public || npm publish --access public
+            else
+              npm publish --access public
+            fi
+          fi
