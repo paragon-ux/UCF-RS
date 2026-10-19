@@ -39,9 +39,9 @@ Requires Python 3.10+ (standard library only — nothing to install).
 python scripts/ucf_rs.py init
 
 # Cite lines 1-4 of a file under a stable handle.
-# --task-context registers the handle on the fly; omit it once the handle
-# is already tracked in docs/handle-registry.jsonl (see "Handles and
-# partitions" in the User Guide).
+# --task-context allows an explicit task-context handle for this call without
+# requiring or writing an entry in docs/handle-registry.jsonl or
+# .ucf-rs/handle-cache.jsonl (see "Handles and partitions" in the User Guide).
 python scripts/ucf_rs.py activate --handle AUTH-ROTATE --path src/auth.py --lines 1:4 --task-context
 
 # See current citation status
@@ -102,6 +102,7 @@ UCF-RS as a conformance reference but does not depend on its internals.
 
 - [User Guide](docs/user-guide.md) — for people using UCF-RS on a project
 - [Agent Guide](docs/agent-guide.md) — for AI agents driving UCF-RS
+- [Doc-to-Code Audit Recipe](docs/doc-audit-recipe.md) — auditing documentation claims against code with an external sidecar file
 - [Contributing](CONTRIBUTING.md)
 - [Architecture](docs/architecture.md)
 - [Commands](docs/commands.md)
@@ -109,6 +110,7 @@ UCF-RS as a conformance reference but does not depend on its internals.
 - [Data handling policy](docs/data-policy.md)
 - [Relationship to Reqtrace](docs/reqtrace-relationship.md)
 - [Future direction](docs/future-direction.md)
+- [Fork proposal: Doc-to-Code Claim Audit](docs/fork-proposal-doc-audit.md)
 
 ## Validation
 

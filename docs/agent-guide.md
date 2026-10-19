@@ -131,15 +131,22 @@ python scripts/ucf_rs.py export ledger
 ```
 
 Omit `--task-context` once the handle is already registered in
-`docs/handle-registry.jsonl` — without it and without a registry entry,
-`activate`/`preflight` exit non-zero with a plain-text error on stderr (not
-JSON, even under `--format json`), so check the exit code rather than only
-trying to parse stdout.
+`docs/handle-registry.jsonl` (or `.ucf-rs/handle-cache.jsonl` via
+`import-registry`) — without it and without a registry/cache entry,
+`activate`/`preflight` exit with code `2` (`EXIT_VALIDATION_ERROR`) and a
+plain-text `error: ...` message on stderr (not JSON, even under
+`--format json`), so check the exit code rather than only trying to parse
+stdout. Operational check failures (`status --strict`, including
+`E_STORE_UNINITIALIZED` on an uninitialized store, `reconcile --partition-id`
+when not reconciled, and `session open` with diagnostics) exit with code `1`
+(`EXIT_CHECK_FAILURE`).
 
 ## See also
 
 - [User Guide](user-guide.md) — the same workflow from a human operator's
   point of view
+- [Doc-to-Code Audit Recipe](doc-audit-recipe.md) — auditing documentation
+  claims against a codebase using existing UCF-RS features and a sidecar file
 - [`docs/commands.md`](commands.md) — full command and server reference
 - [`docs/data-policy.md`](data-policy.md) — exactly what is and isn't
   disclosed by default
