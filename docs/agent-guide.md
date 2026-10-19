@@ -3,7 +3,7 @@
 This guide is for AI agents and automated callers that use UCF-RS **as a
 tool** — to create, check, or maintain citations while working in a codebase.
 
-This is different from [`AGENTS.md`](../AGENTS.md) at the repository root,
+This is different from [`AGENTS.md`](https://github.com/paragon-ux/UCF-RS/blob/main/AGENTS.md) at the repository root,
 which is contributor guidance for coding agents modifying UCF-RS's *own*
 source code. If you're editing UCF-RS itself, read that file. If you're an
 agent citing evidence *in a project that uses* UCF-RS, this is your guide.
@@ -150,5 +150,5 @@ when not reconciled, and `session open` with diagnostics) exit with code `1`
 - [`docs/commands.md`](commands.md) — full command and server reference
 - [`docs/data-policy.md`](data-policy.md) — exactly what is and isn't
   disclosed by default
-- [`AGENTS.md`](../AGENTS.md) — guidance for agents contributing to UCF-RS's
+- [`AGENTS.md`](https://github.com/paragon-ux/UCF-RS/blob/main/AGENTS.md) — guidance for agents contributing to UCF-RS's
   own codebase (not the same audience as this guide)

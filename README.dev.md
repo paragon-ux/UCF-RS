@@ -1,9 +1,9 @@
-# UCF-RS
+# UCF-RS Developer Reference
 
-UCF-RS is a standalone local runtime for source-clean traceability. The
-`0.1.0` Git tag marks the foundation-hardening baseline: explicit citation
+UCF-RS is a standalone local runtime for source-clean traceability. The `0.3.0`
+release marks the hardened, production-ready baseline: explicit citation
 authority, append-only mutation records, recoverable source-plus-authority
-transactions, and project-level validation.
+transactions, deterministic ledger exports, and strict validation.
 
 UCF-RS is separate from Reqtrace. Reqtrace remains the grep-native v2.1.7
 evidence convention; UCF-RS keeps source files clean, renders citations as
@@ -12,12 +12,13 @@ overlays, and stores authority in a durable citation index plus operation log.
 ## Quickstart
 
 ```bash
-python scripts/ucf_rs.py init
-python scripts/ucf_rs.py activate --handle AUTH-ROTATE --path examples/managed-edit/src/auth.py --lines 1:4
-python scripts/ucf_rs.py status --format json
-python scripts/ucf_rs.py resolve --path examples/managed-edit/src/auth.py
-python scripts/ucf_rs.py export ledger
-python scripts/ucf_rs.py render
+# In examples/managed-edit:
+python ../../scripts/ucf_rs.py --root . init
+python ../../scripts/ucf_rs.py --root . activate --handle AUTH-ROTATE --path src/auth.py --lines 1:4
+python ../../scripts/ucf_rs.py --root . status --format json
+python ../../scripts/ucf_rs.py --root . resolve --path src/auth.py
+python ../../scripts/ucf_rs.py --root . export ledger
+python ../../scripts/ucf_rs.py --root . render
 ```
 
 The CLI uses only Python's standard library.
@@ -47,7 +48,7 @@ The CLI uses only Python's standard library.
 - Exact unmanaged move recovery from accepted evidence line hashes.
 - Runtime citation resolution over stdio or local HTTP, deterministic ledger export, generated status/report rendering, and virtual block export.
 - Brownfield compatibility with Reqtrace `docs/handle-registry.jsonl` and advisory `@reqtrace` discovery.
-- Strict status checks that detect stale exported ledgers.
+- Strict status checks that detect stale exported ledgers and uninitialized stores (`E_STORE_UNINITIALIZED`).
 - Local HTTP guardrails: loopback-only binding by default, bounded request bodies, and explicit unsafe remote opt-in with no authentication or TLS.
 
 ## Storage And Data Policy
@@ -56,6 +57,7 @@ The CLI uses only Python's standard library.
 - [Data handling policy](docs/data-policy.md) defines retention, visibility, export, source/evidence disclosure, diagnostic redaction, backups, deletion, and local HTTP exposure.
 - [Architecture](docs/architecture.md) and [commands](docs/commands.md) describe
   the runtime model and CLI/API surface.
+- [Glossary](docs/glossary.md) provides plain-language definitions for core terms.
 
 ## Validation
 

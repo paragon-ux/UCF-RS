@@ -25,6 +25,7 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 EXPECTED = {
     "LICENSE",
     "README.md",
+    "README.dev.md",
     "bin/ucf-rs.js",
     "docs/agent-guide.md",
     "docs/commands.md",

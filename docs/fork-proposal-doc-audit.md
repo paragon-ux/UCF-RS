@@ -13,8 +13,11 @@
 
 ## Why this belongs in a fork, not UCF-RS core
 
-Per [`.ucf-rs-fork-manifest.json`](../.ucf-rs-fork-manifest.json) and
+Per [`.ucf-rs-fork-manifest.json`](https://github.com/paragon-ux/UCF-RS/blob/main/.ucf-rs-fork-manifest.json) and
 [`docs/architecture.md`](architecture.md):
+
+(All examples in this proposal reference the Codex repository pinned to commit
+`1f17a0a04b5c53ef2ea89b7d874764139321b26a`.)
 
 - **Core responsibility:** Maintain an append-only local authority
   (`.ucf-rs/operation-log.jsonl` and `.ucf-rs/citation-index.jsonl`) mapping

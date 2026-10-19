@@ -11,6 +11,9 @@ repository's documentation is supported by its codebase, while:
    in an external sidecar JSONL file outside both the target repository and
    `.ucf-rs/` that UCF-RS never reads.
 
+All findings and examples in this recipe are pinned to the Codex repository at
+commit `1f17a0a04b5c53ef2ea89b7d874764139321b26a`.
+
 ---
 
 ## 1. Initialize `.ucf-rs/` and pre-cache handles
@@ -59,10 +62,29 @@ python scripts/ucf_rs.py --root /path/to/codex import-registry \
 rm /path/to/codex/.ucf-rs/temp-registry.jsonl
 ```
 
+#### Security boundary & reconciling with the "never hand-edit `.ucf-rs/`" rule
+
+- **Why `--path` is confined to the project root:** `import-registry` validates
+  all input paths using `project_path(root, path)`. This is a deliberate,
+  fail-closed boundary: CLI operations cannot perform directory traversal
+  (`../../`) or open arbitrary filesystem files outside the repository.
+- **Reconciliation with "never hand-edit `.ucf-rs/`":** The agent rule forbidding
+  hand-editing `.ucf-rs/` specifically protects the authoritative state files
+  (`project.json`, `handle-cache.jsonl`, `citation-index.jsonl`,
+  `operation-log.jsonl`, `document-index.jsonl`, `transaction-intent.json`).
+  Manually editing those files corrupts canonical JSON hashes, mutation logs, and
+  transaction locks. In contrast, staging an ephemeral file like
+  `.ucf-rs/temp-registry.jsonl` does not touch or hand-edit the store; it provides
+  an uncommitted input artifact to `import-registry`. The command itself validates
+  and writes the authoritative records into `.ucf-rs/handle-cache.jsonl` under the
+  authority write lock. Removing the temporary file immediately leaves only valid,
+  authoritative state.
+- **Zero-staging alternative:** If you prefer not to stage any files inside
+  `.ucf-rs/`, you can omit `import-registry` entirely and pass `--task-context` on
+  every `preflight` and `activate` invocation.
+
 Once cached in `.ucf-rs/handle-cache.jsonl`, every subsequent `preflight` and
-`activate` call for those handles works without `--task-context` (or you can
-skip `import-registry` and pass `--task-context` on each `preflight` and
-`activate` call).
+`activate` call for those handles works without `--task-context`.
 
 ---
 

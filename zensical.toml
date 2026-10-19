@@ -1,0 +1,116 @@
+[project]
+site_url = "https://paragon-ux.github.io/UCF-RS/"
+site_name = "UCF-RS Documentation"
+site_description = "Source-clean citation tracking: cite code ranges without writing markers into source files"
+site_author = "paragon-ux"
+copyright = "Copyright &copy; 2026 paragon-ux. Released under the MIT License."
+
+repo_url = "https://github.com/paragon-ux/UCF-RS"
+repo_name = "paragon-ux/UCF-RS"
+
+nav = [
+  { "Home" = "index.md" },
+  { "Get Started" = [
+      { "Installation" = "get-started/install.md" },
+      { "Quickstart" = "get-started/quickstart.md" },
+  ]},
+  { "Guides" = [
+      { "User Guide" = "user-guide.md" },
+      { "Agent Guide" = "agent-guide.md" },
+      { "Doc-to-Code Audit Recipe" = "doc-audit-recipe.md" },
+  ]},
+  { "Concepts" = [
+      { "Architecture" = "architecture.md" },
+      { "Glossary" = "glossary.md" },
+      { "Relationship to Reqtrace" = "reqtrace-relationship.md" },
+      { "Future Direction" = "future-direction.md" },
+  ]},
+  { "Reference" = [
+      { "Commands" = "commands.md" },
+      { "Storage Schemas" = "storage-schemas.md" },
+      { "Data Handling Policy" = "data-policy.md" },
+  ]},
+  { "Project" = [
+      { "Contributing" = "project/contributing.md" },
+      { "Security" = "project/security.md" },
+      { "Release Guide" = "project/releasing.md" },
+      { "Release Notes" = "release-notes/0.3.0.md" },
+      { "Fork Proposal: Doc Audit" = "fork-proposal-doc-audit.md" },
+  ]},
+]
+
+[project.validation]
+invalid_links = true
+invalid_link_anchors = true
+
+[project.theme]
+language = "en"
+features = [
+  "announce.dismiss",
+  "content.code.annotate",
+  "content.code.copy",
+  "content.code.select",
+  "content.footnote.tooltips",
+  "content.tabs.link",
+  "content.tooltips",
+  "navigation.footer",
+  "navigation.indexes",
+  "navigation.instant",
+  "navigation.instant.prefetch",
+  "navigation.path",
+  "navigation.sections",
+  "navigation.top",
+  "navigation.tracking",
+  "search.highlight",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to system preference"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/paragon-ux/UCF-RS"
+
+[project.markdown_extensions]
+abbr = {}
+admonition = {}
+attr_list = {}
+def_list = {}
+footnotes = {}
+md_in_html = {}
+toc.permalink = true
+pymdownx.arithmatex.generic = true
+pymdownx.betterem = {}
+pymdownx.caret = {}
+pymdownx.details = {}
+pymdownx.emoji.emoji_generator = "zensical.extensions.emoji.to_svg"
+pymdownx.emoji.emoji_index = "zensical.extensions.emoji.twemoji"
+pymdownx.highlight.anchor_linenums = true
+pymdownx.highlight.line_spans = "__span"
+pymdownx.highlight.pygments_lang_class = true
+pymdownx.inlinehilite = {}
+pymdownx.keys = {}
+pymdownx.magiclink = {}
+pymdownx.mark = {}
+pymdownx.smartsymbols = {}
+pymdownx.superfences.custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+pymdownx.tabbed.alternate_style = true
+pymdownx.tabbed.combine_header_slug = true
+pymdownx.tasklist.custom_checkbox = true
+pymdownx.tilde = {}
